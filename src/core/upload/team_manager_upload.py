@@ -5,13 +5,11 @@ Team Manager 上传功能
 
 import logging
 from typing import List, Tuple
-from datetime import datetime
 
 from curl_cffi import requests as cffi_requests
 
-from ...database.session import get_db
 from ...database.models import Account
-from ...config.settings import get_settings
+from ...database.session import get_db
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +32,7 @@ def upload_to_team_manager(
     if not account.access_token:
         return False, "账号缺少 access_token"
 
-    url = api_url.rstrip("/") + "/api/accounts/import"
+    url = api_url.rstrip("/") + "/admin/teams/import"
     headers = {
         "X-API-Key": api_key,
         "Content-Type": "application/json",
@@ -46,6 +44,7 @@ def upload_to_team_manager(
         "session_token": account.session_token or "",
         "refresh_token": account.refresh_token or "",
         "client_id": account.client_id or "",
+        "account_id": account.account_id or "",
     }
 
     try:
@@ -78,7 +77,7 @@ def batch_upload_to_team_manager(
     api_key: str,
 ) -> dict:
     """
-    批量上传账号到 Team Manager
+    批量上传账号到 Team Manager（使用 batch 模式，一次请求提交所有账号）
 
     Returns:
         包含成功/失败统计和详情的字典
@@ -91,6 +90,8 @@ def batch_upload_to_team_manager(
     }
 
     with get_db() as db:
+        lines = []
+        valid_accounts = []
         for account_id in account_ids:
             account = db.query(Account).filter(Account.id == account_id).first()
             if not account:
@@ -99,24 +100,70 @@ def batch_upload_to_team_manager(
                     {"id": account_id, "email": None, "success": False, "error": "账号不存在"}
                 )
                 continue
-
             if not account.access_token:
                 results["skipped_count"] += 1
                 results["details"].append(
                     {"id": account_id, "email": account.email, "success": False, "error": "缺少 Token"}
                 )
                 continue
+            # 格式：邮箱,AT,RT,ST,ClientID
+            lines.append(",".join([
+                account.email or "",
+                account.access_token or "",
+                account.refresh_token or "",
+                account.session_token or "",
+                account.client_id or "",
+            ]))
+            valid_accounts.append(account)
 
-            success, message = upload_to_team_manager(account, api_url, api_key)
-            if success:
-                results["success_count"] += 1
-                results["details"].append(
-                    {"id": account_id, "email": account.email, "success": True, "message": message}
-                )
+        if not valid_accounts:
+            return results
+
+        url = api_url.rstrip("/") + "/admin/teams/import"
+        headers = {
+            "X-API-Key": api_key,
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "import_type": "batch",
+            "content": "\n".join(lines),
+        }
+
+        try:
+            resp = cffi_requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                proxies=None,
+                timeout=60,
+                impersonate="chrome110",
+            )
+            if resp.status_code in (200, 201):
+                for account in valid_accounts:
+                    results["success_count"] += 1
+                    results["details"].append(
+                        {"id": account.id, "email": account.email, "success": True, "message": "批量上传成功"}
+                    )
             else:
+                error_msg = f"批量上传失败: HTTP {resp.status_code}"
+                try:
+                    detail = resp.json()
+                    if isinstance(detail, dict):
+                        error_msg = detail.get("message", error_msg)
+                except Exception:
+                    error_msg = f"{error_msg} - {resp.text[:200]}"
+                for account in valid_accounts:
+                    results["failed_count"] += 1
+                    results["details"].append(
+                        {"id": account.id, "email": account.email, "success": False, "error": error_msg}
+                    )
+        except Exception as e:
+            logger.error(f"Team Manager 批量上传异常: {e}")
+            error_msg = f"上传异常: {str(e)}"
+            for account in valid_accounts:
                 results["failed_count"] += 1
                 results["details"].append(
-                    {"id": account_id, "email": account.email, "success": False, "error": message}
+                    {"id": account.id, "email": account.email, "success": False, "error": error_msg}
                 )
 
     return results
@@ -134,7 +181,7 @@ def test_team_manager_connection(api_url: str, api_key: str) -> Tuple[bool, str]
     if not api_key:
         return False, "API Key 不能为空"
 
-    url = api_url.rstrip("/") + "/api/accounts/import"
+    url = api_url.rstrip("/") + "/admin/teams/import"
     headers = {"X-API-Key": api_key}
 
     try:

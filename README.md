@@ -31,19 +31,21 @@
   - 降级轮询备用方案
 
 - **代理管理**
-  - 静态代理配置
   - 动态代理（通过 API 每次获取新 IP）
-  - 代理列表（随机选取，记录使用时间）
+  - 代理列表（随机选取，支持设置默认代理，记录使用时间）
 
 - **账号管理**
   - 查看、删除、批量操作
   - Token 刷新与验证
-  - 导出（JSON / CSV / CPA 格式）
+  - 订阅状态管理（手动标记 / 自动检测 plus/team/free）
+  - 导出格式：JSON / CSV / CPA 格式 / Sub2API 格式
     - 单个账号导出为独立 `.json` 文件
-    - 多个账号打包为 `.zip`，每个账号一个独立文件
-  - CPA 上传（Codex Protocol API，直连不走代理）
-  - 订阅状态管理（手动标记 / 自动检测 plus/team）
-  - Team Manager 上传（直连不走代理）
+    - 多个 CPA 账号打包为 `.zip`，每个账号一个独立文件
+    - Sub2API 格式所有账号合并为单个 JSON
+  - 上传目标（直连不走代理）：
+    - **CPA**：支持多服务配置，上传时选择目标服务
+    - **Sub2API**：支持多服务配置，标准 sub2api-data 格式
+    - **Team Manager**：支持多服务配置
 
 - **支付升级**
   - 为账号生成 ChatGPT Plus 或 Team 订阅支付链接
@@ -51,12 +53,13 @@
   - Team 套餐支持自定义工作区名称、座位数、计费周期
 
 - **系统设置**
-  - 代理配置（静态 + 动态）
+  - 代理配置（动态代理 + 代理列表，支持设默认）
+  - CPA 服务列表管理（多服务，连接测试）
+  - Sub2API 服务列表管理（多服务，连接测试）
+  - Team Manager 服务列表管理（多服务，连接测试）
   - Outlook OAuth 参数
   - 注册参数（超时、重试、密码长度等）
   - 验证码等待配置
-  - CPA 上传配置
-  - Team Manager 配置（API URL + API Key）
   - 数据库管理（备份、清理）
   - 支持远程 PostgreSQL
 
@@ -152,14 +155,16 @@ codex-register-v2/
 ├── build.sh            # Linux/macOS 打包脚本
 ├── src/
 │   ├── config/         # 配置管理（Pydantic Settings）
-│   ├── core/           # 核心功能（注册引擎、HTTP 客户端、CPA 上传、支付、TM 上传）
-│   ├── database/       # 数据库（SQLAlchemy + SQLite）
+│   ├── core/
+│   │   ├── openai/     # OAuth、Token 刷新、支付核心
+│   │   └── upload/     # CPA / Sub2API / Team Manager 上传模块
+│   ├── database/       # 数据库（SQLAlchemy + SQLite/PostgreSQL）
 │   ├── services/       # 邮箱服务实现
-│   └── web/            # FastAPI Web 应用
+│   └── web/
 │       ├── app.py      # 应用入口、路由挂载
-│       ├── routes/     # API 路由
 │       ├── task_manager.py  # 任务/日志/WebSocket 管理
-│       └── routes/websocket.py  # WebSocket 处理
+│       └── routes/     # API 路由
+│           └── upload/ # CPA / Sub2API / TM 服务管理路由
 ├── templates/          # Jinja2 HTML 模板
 ├── static/             # 静态资源（CSS / JS）
 └── data/               # 运行时数据目录（数据库、日志）
@@ -184,44 +189,40 @@ codex-register-v2/
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/registration/start` | 启动单次注册 |
-| POST | `/api/registration/batch` | 启动批量注册（支持 `concurrency`、`mode` 参数） |
-| GET | `/api/registration/batch/{id}` | 批量任务状态 |
-| POST | `/api/registration/batch/{id}/cancel` | 取消批量任务 |
-| POST | `/api/registration/outlook-batch` | 启动 Outlook 批量注册 |
-| GET | `/api/registration/outlook-batch/{id}` | Outlook 批量状态 |
+| POST | `/api/registration/start` | 启动注册任务 |
 | GET | `/api/registration/tasks` | 任务列表 |
-| GET | `/api/registration/tasks/{uuid}` | 任务详情 |
 | GET | `/api/registration/tasks/{uuid}/logs` | 任务日志 |
 | POST | `/api/registration/tasks/{uuid}/cancel` | 取消任务 |
-| DELETE | `/api/registration/tasks/{uuid}` | 删除任务 |
 | GET | `/api/registration/available-services` | 可用邮箱服务 |
-| GET | `/api/registration/outlook-accounts` | 可用 Outlook 账户 |
 
 ### 账号管理
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/accounts` | 账号列表 |
+| GET | `/api/accounts` | 账号列表（支持分页、筛选、搜索） |
 | GET | `/api/accounts/{id}` | 账号详情 |
+| PATCH | `/api/accounts/{id}` | 更新账号（状态/cookies） |
 | DELETE | `/api/accounts/{id}` | 删除账号 |
 | POST | `/api/accounts/batch-delete` | 批量删除 |
 | POST | `/api/accounts/export/json` | 导出 JSON |
 | POST | `/api/accounts/export/csv` | 导出 CSV |
 | POST | `/api/accounts/export/cpa` | 导出 CPA 格式（单文件或 ZIP） |
+| POST | `/api/accounts/export/sub2api` | 导出 Sub2API 格式 |
 | POST | `/api/accounts/{id}/refresh` | 刷新 Token |
 | POST | `/api/accounts/batch-refresh` | 批量刷新 Token |
 | POST | `/api/accounts/{id}/validate` | 验证 Token |
 | POST | `/api/accounts/batch-validate` | 批量验证 Token |
-| POST | `/api/accounts/{id}/upload-cpa` | 上传到 CPA |
+| POST | `/api/accounts/{id}/upload-cpa` | 上传单账号到 CPA |
 | POST | `/api/accounts/batch-upload-cpa` | 批量上传到 CPA |
+| POST | `/api/accounts/{id}/upload-sub2api` | 上传单账号到 Sub2API |
+| POST | `/api/accounts/batch-upload-sub2api` | 批量上传到 Sub2API |
 
 ### 支付升级
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/payment/generate-link` | 生成 Plus/Team 支付链接 |
-| POST | `/api/payment/open-incognito` | 后端无痕模式打开浏览器 |
+| POST | `/api/payment/generate` | 生成 Plus/Team 支付链接 |
+| POST | `/api/payment/open` | 后端无痕模式打开浏览器 |
 | POST | `/api/payment/accounts/{id}/mark-subscription` | 手动标记订阅类型 |
 | POST | `/api/payment/accounts/batch-check-subscription` | 批量检测订阅状态 |
 | POST | `/api/payment/accounts/{id}/upload-tm` | 上传单账号到 Team Manager |
@@ -233,31 +234,40 @@ codex-register-v2/
 |------|------|------|
 | GET | `/api/email-services` | 服务列表 |
 | POST | `/api/email-services` | 添加服务 |
-| GET | `/api/email-services/{id}` | 服务详情 |
 | PATCH | `/api/email-services/{id}` | 更新服务 |
 | DELETE | `/api/email-services/{id}` | 删除服务 |
 | POST | `/api/email-services/{id}/test` | 测试服务 |
 | POST | `/api/email-services/outlook/batch-import` | 批量导入 Outlook |
+
+### 上传服务管理
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET/POST | `/api/cpa-services` | CPA 服务列表/创建 |
+| PUT/DELETE | `/api/cpa-services/{id}` | 更新/删除 CPA 服务 |
+| POST | `/api/cpa-services/{id}/test` | 测试 CPA 连接 |
+| GET/POST | `/api/sub2api-services` | Sub2API 服务列表/创建 |
+| PUT/DELETE | `/api/sub2api-services/{id}` | 更新/删除 Sub2API 服务 |
+| POST | `/api/sub2api-services/{id}/test` | 测试 Sub2API 连接 |
+| GET/POST | `/api/tm-services` | Team Manager 服务列表/创建 |
+| PUT/DELETE | `/api/tm-services/{id}` | 更新/删除 TM 服务 |
+| POST | `/api/tm-services/{id}/test` | 测试 TM 连接 |
 
 ### 设置
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/settings` | 获取所有设置 |
-| POST | `/api/settings/proxy` | 更新代理设置 |
-| POST | `/api/settings/dynamic-proxy` | 更新动态代理设置 |
-| POST | `/api/settings/cpa` | 更新 CPA 设置 |
-| POST | `/api/settings/cpa/test` | 测试 CPA 连接 |
-| GET/POST | `/api/settings/team-manager` | Team Manager 设置 |
-| POST | `/api/settings/team-manager/test` | 测试 Team Manager 连接 |
+| POST | `/api/settings/proxy/dynamic` | 更新动态代理设置 |
+| GET/POST/DELETE | `/api/settings/proxies` | 代理列表管理 |
+| POST | `/api/settings/proxies/{id}/set-default` | 设为默认代理 |
 | GET | `/api/settings/database` | 数据库信息 |
 
 ### WebSocket
 
 | 路径 | 说明 |
 |------|------|
-| `ws://host/api/ws/task/{uuid}` | 单任务实时日志 |
-| `ws://host/api/ws/batch/{id}` | 批量任务实时状态与日志 |
+|| `ws://host/api/ws/logs/{uuid}` | 实时日志流 |
 
 ## Docker 部署
 
@@ -290,11 +300,12 @@ volumes:
   - ./logs:/app/logs
 ```
 
-**代理配置**：
+**环境变量配置**：
 ```yaml
 environment:
-  - HTTP_PROXY=http://your-proxy:port
-  - HTTPS_PROXY=http://your-proxy:port
+  - APP_ACCESS_PASSWORD=mypassword
+  - APP_HOST=0.0.0.0
+  - APP_PORT=8000
 ```
 
 ### 常用命令
@@ -315,13 +326,12 @@ docker-compose build --no-cache
 - 首次运行会自动创建 `data/` 目录和 SQLite 数据库
 - 所有账号和设置数据存储在 `data/register.db`
 - 日志文件写入 `logs/` 目录
-- 代理设置优先级：动态代理 > 代理列表（随机） > 静态默认代理
+- 代理优先级：动态代理 > 代理列表（随机/默认） > 直连
+- CPA / Sub2API / Team Manager 上传始终直连，不走代理
 - 注册时自动随机生成用户名和生日（年龄范围 18-45 岁）
-- CPA 上传始终直连，不经过代理
-- Team Manager 上传始终直连，不经过代理
 - 支付链接生成使用账号 access_token 鉴权，走全局代理配置
 - 无痕浏览器优先使用 playwright（注入 cookie 直达支付页）；未安装时降级为系统 Chrome/Edge 无痕模式
-- 安装完整支付功能：`pip install playwright && playwright install chromium`（可选）
+- 安装完整支付功能：`pip install ".[payment]" && playwright install chromium`（可选）
 - 订阅状态自动检测调用 `chatgpt.com/backend-api/me`，走全局代理
 - 批量注册并发数上限为 50，线程池大小已相应调整
 
