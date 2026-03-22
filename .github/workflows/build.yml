@@ -21,13 +21,13 @@ jobs:
         include:
           - os: windows-latest
             artifact_name: codex-register.exe
-            asset_name: codex-register-windows-x64.exe
+            asset_name: codex-register-v2-windows-x64.exe
           - os: ubuntu-latest
             artifact_name: codex-register
-            asset_name: codex-register-linux-x64
+            asset_name: codex-register-v2-linux-x64
           - os: macos-latest
             artifact_name: codex-register
-            asset_name: codex-register-macos-arm64
+            asset_name: codex-register-v2-macos-arm64
 
     steps:
       - name: 检出代码
@@ -103,14 +103,14 @@ jobs:
           files: release/*
           generate_release_notes: true
           body: |
-            ## OpenAI 自动注册系统 v2
+            ## OpenAI 账号管理系统 v2
 
             ### 下载说明
             | 平台 | 文件 |
             |------|------|
-            | Windows x64 | `codex-register-windows-x64.exe` |
-            | Linux x64 | `codex-register-linux-x64` |
-            | macOS ARM64 | `codex-register-macos-arm64` |
+            | Windows x64 | `codex-register-v2-windows-x64.exe` |
+            | Linux x64 | `codex-register-v2-linux-x64` |
+            | macOS ARM64 | `codex-register-v2-macos-arm64` |
 
             ### 使用方法
             ```bash
