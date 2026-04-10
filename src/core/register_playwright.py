@@ -1044,6 +1044,11 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
                 return result
 
             self._emit_status("session_fetch", "同步 chat 会话", step_index=11)
+            self._append_account_checkpoint(
+                "account_created",
+                oauth=False,
+                metadata={"status": "created"},
+            )
             session_data = self.callback_and_get_session(created)
             result.workspace_id = (
                 self._extract_workspace_id_from_auth_json(session_data)
@@ -1082,6 +1087,16 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
                 "registered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "registration_mode": self._resolved_execution_mode(),
             }
+            self._append_account_checkpoint(
+                "oauth_success",
+                oauth=True,
+                metadata={
+                    "source": result.source,
+                    "account_id": result.account_id,
+                    "workspace_id": result.workspace_id,
+                    "status": "oauth_success",
+                },
+            )
             return result
 
         except EmailAlreadyUsedError:

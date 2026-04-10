@@ -16,6 +16,7 @@ from typing import Optional, Dict, Any, Tuple, Callable
 
 from curl_cffi import requests as cffi_requests
 
+from .account_checkpoint import append_account_checkpoint
 from .http_client import OpenAIHTTPClient
 from .openai.oauth import OAuthManager, OAuthStart
 from ..config.constants import (
@@ -247,6 +248,46 @@ class RegistrationEngine:
             self.status_callback(payload)
         except Exception as e:
             logger.warning(f"上报任务阶段状态失败: {e}")
+
+    def _checkpoint_metadata(self, **extra: Any) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {
+            "source": "login" if self._is_existing_account else "register",
+            "email_service": self.email_service.service_type.value,
+            "email_service_id": (
+                self.email_info.get("service_id")
+                if isinstance(self.email_info, dict)
+                else ""
+            ),
+            "registration_mode": self._resolved_execution_mode(),
+            "task_uuid": self.task_uuid or "",
+            "proxy_used": self.proxy_url or "",
+        }
+        metadata.update(extra)
+        return metadata
+
+    def _append_account_checkpoint(
+        self,
+        stage: str,
+        *,
+        oauth: Optional[bool] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not self.email:
+            return
+
+        checkpoint_metadata = self._checkpoint_metadata(**dict(metadata or {}))
+        try:
+            append_account_checkpoint(
+                self.email,
+                self.password or "",
+                stage=stage,
+                oauth=oauth,
+                metadata=checkpoint_metadata,
+            )
+            oauth_text = "-" if oauth is None else ("1" if oauth else "0")
+            self._log(f"Incremental accounts.txt saved: stage={stage}, oauth={oauth_text}")
+        except Exception as exc:
+            self._log(f"accounts.txt incremental save failed: {exc}", "warning")
 
     def _current_device_id(self) -> Optional[str]:
         """优先复用现有 Device ID，避免重复触发慢请求。"""
@@ -1726,6 +1767,11 @@ class RegistrationEngine:
                 if not self._create_user_account():
                     result.error_message = "创建用户账户失败"
                     return result
+                self._append_account_checkpoint(
+                    "account_created",
+                    oauth=False,
+                    metadata={"status": "created"},
+                )
 
             next_step = 13
             callback_url = None
@@ -1820,6 +1866,16 @@ class RegistrationEngine:
                 "is_existing_account": self._is_existing_account,
                 "registration_mode": self._resolved_execution_mode(),
             }
+            self._append_account_checkpoint(
+                "oauth_success",
+                oauth=True,
+                metadata={
+                    "source": result.source,
+                    "account_id": result.account_id,
+                    "workspace_id": result.workspace_id,
+                    "status": "oauth_success",
+                },
+            )
 
             return result
 

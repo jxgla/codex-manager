@@ -9,9 +9,10 @@ from typing import Optional
 from ..services.base import BaseEmailService
 from .register import RegistrationEngine
 from .register_playwright import PlaywrightRegistrationEngine
+from .register_playwright_v3 import PlaywrightRegistrationEngineV3
 
 DEFAULT_ENGINE_MODE = "playwright_v2"
-SUPPORTED_ENGINE_MODES = {"legacy", "playwright_v2"}
+SUPPORTED_ENGINE_MODES = {"legacy", "playwright_v2", "playwright_v3"}
 
 
 def normalize_engine_mode(mode: Optional[str]) -> str:
@@ -23,6 +24,11 @@ def normalize_engine_mode(mode: Optional[str]) -> str:
         "playwright": "playwright_v2",
         "playwrightv2": "playwright_v2",
         "browser": "playwright_v2",
+        "playwright_v3": "playwright_v3",
+        "playwrightv3": "playwright_v3",
+        "browser_v3": "playwright_v3",
+        "two_stage": "playwright_v3",
+        "v3": "playwright_v3",
     }
     normalized = aliases.get(normalized, normalized)
     if normalized not in SUPPORTED_ENGINE_MODES:
@@ -40,11 +46,12 @@ def create_registration_engine(
     task_uuid: Optional[str] = None,
 ):
     normalized_mode = normalize_engine_mode(mode)
-    engine_cls = (
-        PlaywrightRegistrationEngine
-        if normalized_mode == "playwright_v2"
-        else RegistrationEngine
-    )
+    if normalized_mode == "playwright_v3":
+        engine_cls = PlaywrightRegistrationEngineV3
+    elif normalized_mode == "playwright_v2":
+        engine_cls = PlaywrightRegistrationEngine
+    else:
+        engine_cls = RegistrationEngine
     return engine_cls(
         email_service=email_service,
         proxy_url=proxy_url,
