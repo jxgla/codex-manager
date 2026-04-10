@@ -1812,10 +1812,15 @@ async def get_task_logs(task_uuid: str):
             raise HTTPException(status_code=404, detail="任务不存在")
 
         logs = task.logs or ""
+        runtime_status = task_manager.get_status(task_uuid) or {}
         return {
             "task_uuid": task_uuid,
-            "status": task.status,
-            "logs": logs.split("\n") if logs else []
+            "status": runtime_status.get("status") or task.status,
+            "logs": logs.split("\n") if logs else [],
+            "error": runtime_status.get("error") or task.error_message,
+            "error_message": task.error_message,
+            "email": runtime_status.get("email"),
+            "email_service": runtime_status.get("email_service"),
         }
 
 

@@ -37,6 +37,15 @@ let batchWsHeartbeatInterval = null;  // 批量任务心跳定时器
 let activeTaskUuid = null;   // 当前活跃的单任务 UUID（用于页面重新可见时重连）
 let activeBatchId = null;    // 当前活跃的批量任务 ID（用于页面重新可见时重连）
 
+function getTaskFailureMessage(data) {
+    const errorMessage = data && typeof data.error === 'string' && data.error.trim()
+        ? data.error.trim()
+        : (data && typeof data.error_message === 'string' && data.error_message.trim()
+            ? data.error_message.trim()
+            : '');
+    return errorMessage ? `注册失败: ${errorMessage}` : '注册失败';
+}
+
 // DOM 元素
 const elements = {
     form: document.getElementById('registration-form'),
@@ -502,7 +511,7 @@ async function handleStartRegistration(e) {
     // 构建请求数据（代理从设置中自动获取）
     const requestData = {
         email_service_type: emailServiceType,
-        engine_mode: elements.engineMode ? elements.engineMode.value : 'playwright_v2',
+        engine_mode: elements.engineMode ? elements.engineMode.value : 'playwright_v3',
         auto_upload_cpa: elements.autoUploadCpa ? elements.autoUploadCpa.checked : false,
         cpa_service_ids: elements.autoUploadCpa && elements.autoUploadCpa.checked ? getSelectedServiceIds(elements.cpaServiceSelect) : [],
         auto_upload_sub2api: elements.autoUploadSub2api ? elements.autoUploadSub2api.checked : false,
@@ -612,8 +621,9 @@ function connectWebSocket(taskUuid) {
                             // 刷新账号列表
                             loadRecentAccounts();
                         } else if (data.status === 'failed') {
-                            addLog('error', '[错误] 注册失败');
-                            toast.error('注册失败');
+                            const failureMessage = getTaskFailureMessage(data);
+                            addLog('error', `[错误] ${failureMessage}`);
+                            toast.error(failureMessage);
                         } else if (data.status === 'cancelled' || data.status === 'cancelling') {
                             addLog('warning', '[警告] 任务已取消');
                         }
@@ -831,8 +841,9 @@ function startLogPolling(taskUuid) {
                         // 刷新账号列表
                         loadRecentAccounts();
                     } else if (data.status === 'failed') {
-                        addLog('error', '[错误] 注册失败');
-                        toast.error('注册失败');
+                        const failureMessage = getTaskFailureMessage(data);
+                        addLog('error', `[错误] ${failureMessage}`);
+                        toast.error(failureMessage);
                     } else if (data.status === 'cancelled') {
                         addLog('warning', '[警告] 任务已取消');
                     }

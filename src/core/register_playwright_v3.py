@@ -35,8 +35,13 @@ class PlaywrightRegistrationEngineV3(PlaywrightRegistrationEngine):
             self._emit_status("ip_check", "Check IP location", step_index=1)
             ip_ok, location = self._check_ip_location()
             if not ip_ok:
+                self._log(f"IP region check blocked current exit node: {location}", "error")
                 result.error_message = f"IP region unsupported: {location}"
                 return result
+            if location:
+                self._log(f"IP region check passed: {location}")
+            else:
+                self._log("IP region check unavailable, continuing without geo restriction", "warning")
 
             self._emit_status("email_prepare", "Create email address", step_index=2)
             if not self._phase_email_prepare():

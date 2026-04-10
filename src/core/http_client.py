@@ -272,23 +272,40 @@ class OpenAIHTTPClient(HTTPClient):
         Returns:
             Tuple[是否支持, 位置信息]
         """
-        try:
-            response = self.get("https://cloudflare.com/cdn-cgi/trace", timeout=10)
-            trace_text = response.text
+        import re
 
-            # 解析位置信息
-            import re
-            loc_match = re.search(r"loc=([A-Z]+)", trace_text)
-            loc = loc_match.group(1) if loc_match else None
+        trace_urls = (
+            "https://cloudflare.com/cdn-cgi/trace",
+            "https://www.cloudflare.com/cdn-cgi/trace",
+        )
+        last_error: Optional[Exception] = None
 
-            # 检查是否支持
-            if loc in ["CN", "HK", "MO"]:
-                return False, loc
-            return True, loc
+        for trace_url in trace_urls:
+            try:
+                response = self.get(trace_url, timeout=10)
+                trace_text = response.text or ""
+                loc_match = re.search(r"(?m)^loc=([A-Z]{2})$", trace_text)
+                loc = loc_match.group(1) if loc_match else None
 
-        except Exception as e:
-            logger.error(f"检查 IP 地理位置失败: {e}")
-            return False, None
+                if not loc:
+                    logger.warning(
+                        "IP location probe returned no loc via %s; continue without region gating",
+                        trace_url,
+                    )
+                    return True, None
+
+                if loc in ["CN", "HK", "MO"]:
+                    return False, loc
+                return True, loc
+            except Exception as e:
+                last_error = e
+                logger.warning("IP location probe failed via %s: %s", trace_url, e)
+
+        logger.warning(
+            "IP location probe unavailable; continue without region gating: %s",
+            last_error,
+        )
+        return True, None
 
     def send_openai_request(
         self,
