@@ -47,3 +47,74 @@ def test_perform_oauth_builds_callback_from_authorization_code(monkeypatch):
     callback_url = engine.perform_oauth()
 
     assert callback_url == "http://localhost:1455/callback?code=oauth-code-xyz&state=state-123"
+
+
+def test_perform_oauth_v2_uses_passwordless_flow():
+    engine = PlaywrightRegistrationEngine(
+        email_service=_dummy_email_service(),
+        callback_logger=lambda *_args, **_kwargs: None,
+    )
+    engine.oauth_start = SimpleNamespace(
+        auth_url="https://auth.openai.com/oauth/authorize?client_id=test",
+        state="state-123",
+        redirect_uri="http://localhost:1455/callback",
+    )
+    engine._resolved_execution_mode = lambda: "playwright_v2"
+    engine._perform_oauth_passwordless_flow = lambda: "http://localhost:1455/callback?code=v2-code&state=state-123"
+
+    callback_url = engine.perform_oauth()
+
+    assert callback_url == "http://localhost:1455/callback?code=v2-code&state=state-123"
+
+
+def test_oauth_submit_workspace_org_for_code_uses_browser_consent_when_workspace_missing(monkeypatch):
+    engine = PlaywrightRegistrationEngine(
+        email_service=_dummy_email_service(),
+        callback_logger=lambda *_args, **_kwargs: None,
+    )
+
+    monkeypatch.setattr(engine, "_decode_auth_session_cookie", lambda: {"workspaces": []})
+    monkeypatch.setattr(engine, "_advance_browser_consent", lambda *args, **kwargs: (True, "oauth-code-from-consent"))
+
+    code = engine._oauth_submit_workspace_org_for_code("https://auth.openai.com/sign-in-with-chatgpt/codex/consent")
+
+    assert code == "oauth-code-from-consent"
+
+
+def test_v2_run_returns_passwordless_success(monkeypatch):
+    engine = PlaywrightRegistrationEngine(
+        email_service=_dummy_email_service(),
+        callback_logger=lambda *_args, **_kwargs: None,
+    )
+    engine.session = SimpleNamespace(cookies=SimpleNamespace(get=lambda _name: ""))
+    monkeypatch.setattr(engine, "_check_ip_location", lambda: (True, "US"))
+    monkeypatch.setattr(engine, "_emit_status", lambda *args, **kwargs: None)
+
+    def fake_email_prepare():
+        engine.email = "v2@example.com"
+        return True
+
+    monkeypatch.setattr(engine, "_phase_email_prepare", fake_email_prepare)
+    monkeypatch.setattr(engine, "_init_session", lambda: True)
+    monkeypatch.setattr(engine, "_start_oauth", lambda: True)
+    monkeypatch.setattr(engine, "perform_oauth", lambda: "http://localhost:1455/callback?code=v2-code&state=state-123")
+    monkeypatch.setattr(
+        engine,
+        "_handle_oauth_callback",
+        lambda _callback: {
+            "account_id": "acct-v2",
+            "access_token": "access-v2",
+            "refresh_token": "refresh-v2",
+            "id_token": "id-v2",
+        },
+    )
+    monkeypatch.setattr(engine, "_decode_auth_session_cookie", lambda: {"workspaces": [{"id": "ws-v2"}]})
+    monkeypatch.setattr(engine, "_compose_cookie_string", lambda: "cookie=v2")
+    monkeypatch.setattr(engine, "_append_account_checkpoint", lambda *args, **kwargs: None)
+
+    result = engine.run()
+
+    assert result.success is True
+    assert result.password == ""
+    assert result.workspace_id == "ws-v2"
+    assert result.metadata["oauth_flow"] == "passwordless"

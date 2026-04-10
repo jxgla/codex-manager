@@ -192,11 +192,11 @@
                                     <label for="engine-mode">注册引擎</label>
                                     <select id="engine-mode" name="engine_mode">
                                         <option value="playwright_v3" selected>Playwright V3</option>
-                                        <option value="playwright_v2">Playwright V2</option>
+                                        <option value="playwright_v2">Playwright V2 (OAuth-first)</option>
                                         <option value="legacy">Legacy</option>
                                     </select>
                                     <small style="color: var(--text-muted); font-size: 0.75rem;">
-                                        新流程默认使用 Playwright V3，两段式注册；旧流程保留为 Playwright V2/Legacy。
+                                        默认使用 Playwright V3 两段式注册；Playwright V2 走直接 OAuth passwordless；Legacy 保留旧协议。
                                     </small>
                                 </div>
 

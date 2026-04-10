@@ -282,6 +282,8 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
         self._cf_primed_hosts: set[str] = set()
         self._last_browser_url = ""
         self.last_session: Dict[str, Any] = {}
+        self.oauth_fail_reason = ""
+        self._oauth_passwordless_active = False
         user_info = generate_random_user_info()
         self.name = user_info.get("name") or "Neo"
         self.birthdate = user_info.get("birthdate") or "2000-02-20"
@@ -431,6 +433,534 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
         if (not raw or current_host == sentinel_host) and self._last_browser_url:
             raw = self._last_browser_url
         return urlparse(raw).path.lower(), raw
+
+    def _open_fresh_browser_page(self, seed_url: str = CHATGPT_SIGNIN_URL):
+        self._ensure_playwright_runtime()
+        self._sync_http_cookies_to_browser(seed_url)
+        previous_page = self._page
+        self._page = self._context.new_page()
+        self._page.set_default_timeout(self._pw_timeout_ms)
+        if previous_page is not None:
+            try:
+                previous_page.close()
+            except Exception:
+                pass
+        return self._page
+
+    @staticmethod
+    def _extract_next_url(data: Any, default: str = "") -> str:
+        if not isinstance(data, dict):
+            return str(default or "").strip()
+        return str(
+            data.get("continue_url")
+            or data.get("url")
+            or data.get("redirect_url")
+            or default
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _extract_page_type(data: Any) -> str:
+        if not isinstance(data, dict):
+            return ""
+        return str(((data.get("page") or {}).get("type")) or "").strip()
+
+    @staticmethod
+    def _looks_like_about_you(page_type: str = "", next_url: str = "") -> bool:
+        lowered = f"{page_type} {next_url}".lower()
+        return "about-you" in lowered or "about_you" in lowered
+
+    @staticmethod
+    def _looks_like_callback(page_type: str = "", next_url: str = "") -> bool:
+        lowered_page = str(page_type or "").lower()
+        lowered_url = str(next_url or "").lower()
+        combined = f"{lowered_page} {lowered_url}"
+        return (
+            "callback" in lowered_page
+            or "localhost:1455/auth/callback" in combined
+            or "/auth/callback" in combined
+            or ("callback" in combined and any(marker in combined for marker in ("code=", "state=", "error=")))
+        )
+
+    @staticmethod
+    def _looks_like_password_step(page_type: str = "", next_url: str = "") -> bool:
+        lowered = f"{page_type} {next_url}".lower()
+        return "password" in lowered or "/log-in/password" in lowered or "login_password" in lowered
+
+    @staticmethod
+    def _looks_like_otp_step(page_type: str = "", next_url: str = "") -> bool:
+        lowered = f"{page_type} {next_url}".lower()
+        return "email_otp_verification" in lowered or "email-verification" in lowered or "email-otp" in lowered
+
+    @staticmethod
+    def _looks_like_consent_step(page_type: str = "", next_url: str = "") -> bool:
+        lowered = f"{page_type} {next_url}".lower()
+        return (
+            "consent" in lowered
+            or "workspace" in lowered
+            or "organization" in lowered
+            or "sign-in-with-chatgpt" in lowered
+        )
+
+    @staticmethod
+    def _looks_like_challenge(page_type: str = "", next_url: str = "") -> bool:
+        lowered = f"{page_type} {next_url}".lower()
+        markers = (
+            "__cf_chl",
+            "cdn-cgi/challenge-platform",
+            "cf-mitigated",
+            "challenges.cloudflare.com",
+            "/api/auth/error",
+        )
+        return any(marker in lowered for marker in markers)
+
+    @staticmethod
+    def _looks_like_add_phone(page_type: str = "", next_url: str = "") -> bool:
+        lowered = f"{page_type} {next_url}".lower()
+        return "add-phone" in lowered or "add_phone" in lowered or "/add-phone" in lowered
+
+    @staticmethod
+    def _text_looks_like_add_phone(text: str = "", page_type: str = "", next_url: str = "") -> bool:
+        lowered = f"{page_type} {next_url} {text}".lower()
+        markers = (
+            "add-phone",
+            "add_phone",
+            "/add-phone",
+            "add phone number",
+            "add a phone number",
+            "enter your phone number",
+            "verify your phone number",
+            "phone number to continue",
+        )
+        return any(marker in lowered for marker in markers)
+
+    def _report_add_phone(
+        self,
+        stage: str,
+        page_type: str = "",
+        next_url: str = "",
+        payload: Optional[Any] = None,
+    ) -> None:
+        self.oauth_fail_reason = "add-phone gate"
+        self._log(
+            f"OAuth add-phone gate stage={stage} page={page_type or '-'} url={(next_url or '-')[:220]}",
+            "warning",
+        )
+        if payload is not None:
+            compact = json.dumps(payload if isinstance(payload, dict) else {"text": str(payload)}, ensure_ascii=False)
+            self._log(f"OAuth add-phone payload: {compact[:320]}", "warning")
+
+    def _detect_browser_add_phone(
+        self,
+        stage: str,
+        candidate_url: str = "",
+        payload: Optional[Any] = None,
+    ) -> bool:
+        current_url = self._abs_auth_url(getattr(self._page, "url", "")) or self._abs_auth_url(candidate_url)
+        if self._looks_like_add_phone(next_url=current_url):
+            self._report_add_phone(stage, next_url=current_url, payload=payload)
+            return True
+        try:
+            html = self._page.content() or ""
+        except Exception:
+            html = ""
+        if html and self._text_looks_like_add_phone(html, next_url=current_url):
+            report_payload = payload if payload is not None else {"url": current_url, "html": html[:260]}
+            self._report_add_phone(stage, next_url=current_url, payload=report_payload)
+            return True
+        return False
+
+    @staticmethod
+    def _locator_is_editable(locator) -> bool:
+        try:
+            return bool(locator.is_editable(timeout=200))
+        except Exception:
+            pass
+        try:
+            return bool(
+                locator.evaluate(
+                    """(el) => {
+                        if (!el) return false;
+                        const disabled = !!el.disabled || el.getAttribute('aria-disabled') === 'true';
+                        const readOnly = !!el.readOnly || el.getAttribute('readonly') !== null;
+                        return !disabled && !readOnly;
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+    def _find_first_visible(self, selectors, timeout_ms: int = 4000, editable_only: bool = False):
+        deadline = time.time() + max(int(timeout_ms or 0), 250) / 1000.0
+        while time.time() < deadline:
+            for selector in selectors:
+                try:
+                    group = self._page.locator(selector)
+                    count = min(group.count(), 6)
+                    for index in range(count):
+                        try:
+                            locator = group.nth(index)
+                            if not locator.is_visible():
+                                continue
+                            if editable_only and not self._locator_is_editable(locator):
+                                continue
+                            return locator
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+            try:
+                self._page.wait_for_timeout(200)
+            except Exception:
+                time.sleep(0.2)
+        return None
+
+    @staticmethod
+    def _locator_value(locator) -> str:
+        try:
+            return str(locator.input_value(timeout=1200))
+        except Exception:
+            pass
+        try:
+            return str(locator.evaluate("(el) => ('value' in el ? el.value : '')"))
+        except Exception:
+            return ""
+
+    def _fill_first_visible(self, selectors, value: str, timeout_ms: int = 4000) -> bool:
+        locator = self._find_first_visible(selectors, timeout_ms=timeout_ms)
+        if not locator:
+            return False
+        target = str(value or "")
+        try:
+            locator.click(timeout=2000)
+        except Exception:
+            pass
+        for attempt in range(3):
+            try:
+                locator.fill("")
+            except Exception:
+                try:
+                    locator.press("Control+A")
+                    locator.press("Backspace")
+                except Exception:
+                    pass
+            try:
+                locator.fill(target)
+            except Exception:
+                try:
+                    if attempt > 0:
+                        locator.press("Control+A")
+                        locator.press("Backspace")
+                    locator.type(target, delay=20)
+                except Exception:
+                    if attempt >= 2:
+                        return False
+                    continue
+            if self._locator_value(locator).strip() == target:
+                return True
+            try:
+                self._page.wait_for_timeout(200)
+            except Exception:
+                time.sleep(0.2)
+        return False
+
+    def _click_first_visible(self, selectors, timeout_ms: int = 4000) -> bool:
+        locator = self._find_first_visible(selectors, timeout_ms=timeout_ms)
+        if not locator:
+            return False
+        try:
+            locator.click(timeout=2000)
+            return True
+        except Exception:
+            try:
+                locator.press("Enter")
+                return True
+            except Exception:
+                return False
+
+    @staticmethod
+    def _auth_email_selectors():
+        return [
+            "input[type='email']",
+            "input[inputmode='email']",
+            "input[autocomplete*='email' i]",
+            "input[autocomplete*='username' i]",
+            "input[name='email']",
+            "input[name='username']",
+            "input[name*='email' i]",
+            "input[id*='email' i]",
+            "input[placeholder*='mail' i]",
+            "input[aria-label*='mail' i]",
+            "input[data-testid*='email' i]",
+        ]
+
+    @staticmethod
+    def _auth_password_selectors():
+        return [
+            "input[type='password']",
+            "input[name='password']",
+            "input[name*='password' i]",
+            "input[id*='password' i]",
+            "input[autocomplete*='current-password' i]",
+            "input[autocomplete*='new-password' i]",
+            "input[placeholder*='password' i]",
+            "input[aria-label*='password' i]",
+            "input[data-testid*='password' i]",
+        ]
+
+    @staticmethod
+    def _auth_submit_selectors():
+        return [
+            "button[type='submit']",
+            "button:has-text('Continue')",
+            "button:has-text('Next')",
+            "button:has-text('Log in')",
+            "button:has-text('Login')",
+            "button:has-text('Sign in')",
+            "button:has-text('Sign up')",
+            "button:has-text('Create account')",
+            "button:has-text('Create Account')",
+            "button:has-text('Verify email')",
+            "[role='button']:has-text('Continue')",
+            "[role='button']:has-text('Next')",
+            "[role='button']:has-text('Sign in')",
+            "[role='button']:has-text('Sign up')",
+            "[role='button']:has-text('Create account')",
+        ]
+
+    def _detect_browser_auth_state(self) -> Tuple[str, str]:
+        current = str(getattr(self._page, "url", "") or "")
+        email_selectors = self._auth_email_selectors()
+        password_selectors = self._auth_password_selectors()
+        if _extract_code_from_url(current):
+            return current, "callback"
+        if self._looks_like_challenge("", current):
+            return current, "challenge"
+        if self._looks_like_callback("", current):
+            return current, "callback"
+        if self._looks_like_about_you("", current):
+            return current, "about_you"
+        if self._looks_like_consent_step("", current):
+            return current, "consent"
+        if self._looks_like_otp_step("", current):
+            return current, "email_otp_verification"
+        email_visible = bool(self._find_first_visible(email_selectors, timeout_ms=300))
+        password_visible = bool(self._find_first_visible(password_selectors, timeout_ms=300))
+        email_editable = bool(self._find_first_visible(email_selectors, timeout_ms=300, editable_only=True))
+        password_editable = bool(self._find_first_visible(password_selectors, timeout_ms=300, editable_only=True))
+        if self._looks_like_password_step("", current) and (password_editable or password_visible):
+            return current, "login_password"
+        if email_editable and password_editable:
+            return current, "login_email_password"
+        if "create-account" in urlparse(current).path.lower() and (password_editable or password_visible):
+            return current, "login_email_password" if email_editable else "login_password"
+        if password_editable or password_visible:
+            return current, "login_password"
+        if email_editable or email_visible:
+            return current, "login_email"
+        return current, ""
+
+    def _oauth_browser_authenticate(self, email: str, password: str, start_url: str = "") -> Tuple[str, str]:
+        target = self._abs_auth_url(start_url or getattr(self._page, "url", "") or f"{self.auth_base}/log-in")
+        current = self._abs_auth_url(getattr(self._page, "url", "") or "")
+        if target and target != current:
+            self._browser_goto(target, referer=f"{self.auth_base}/log-in", wait_ms=1800)
+
+        submit_selectors = self._auth_submit_selectors()
+        email_selectors = self._auth_email_selectors()
+        password_selectors = self._auth_password_selectors()
+        email_submitted = False
+        password_submitted = False
+        challenge_hits = 0
+
+        for _ in range(8):
+            current_url, state = self._detect_browser_auth_state()
+            email_visible = bool(self._find_first_visible(email_selectors, timeout_ms=300))
+            password_visible = bool(self._find_first_visible(password_selectors, timeout_ms=300))
+            password_stage = self._looks_like_password_step("", current_url)
+            if state == "challenge":
+                challenge_hits += 1
+                self._sync_browser_cookies_to_http()
+                if challenge_hits >= 2:
+                    return current_url, state
+                if target:
+                    try:
+                        self._browser_goto(target, referer=current_url or f"{self.auth_base}/log-in", wait_ms=1500)
+                    except Exception:
+                        pass
+                continue
+            if state in ("callback", "about_you", "consent", "email_otp_verification"):
+                self._sync_browser_cookies_to_http()
+                return current_url, state
+            if state == "login_email_password":
+                require_email_fill = not password_stage and not email_submitted
+                if require_email_fill and self._fill_first_visible(email_selectors, email, timeout_ms=2500):
+                    email_submitted = True
+                if not password_submitted and self._fill_first_visible(password_selectors, password, timeout_ms=2500):
+                    password_submitted = True
+                ready_to_submit = password_submitted if password_stage else (email_submitted and password_submitted)
+                if ready_to_submit:
+                    if not self._click_first_visible(submit_selectors, timeout_ms=2500):
+                        try:
+                            self._page.keyboard.press("Enter")
+                        except Exception:
+                            pass
+                    if password_submitted:
+                        self._otp_sent_at = time.time()
+                    self._page.wait_for_timeout(1800)
+                    self._sync_browser_cookies_to_http()
+                    continue
+                self._page.wait_for_timeout(500)
+                self._sync_browser_cookies_to_http()
+                continue
+            if state == "login_email" and not email_submitted:
+                if self._fill_first_visible(email_selectors, email, timeout_ms=2500):
+                    email_submitted = True
+                    if not self._click_first_visible(submit_selectors, timeout_ms=2500):
+                        try:
+                            self._page.keyboard.press("Enter")
+                        except Exception:
+                            pass
+                    self._page.wait_for_timeout(1200)
+                    self._sync_browser_cookies_to_http()
+                    continue
+            if email_visible and not email_submitted:
+                if self._fill_first_visible(email_selectors, email, timeout_ms=2500):
+                    email_submitted = True
+                    self._sync_browser_cookies_to_http()
+                    continue
+            if (state == "login_password" or password_visible) and not password_submitted:
+                if self._fill_first_visible(password_selectors, password, timeout_ms=2500):
+                    password_submitted = True
+                    self._otp_sent_at = time.time()
+                    if not self._click_first_visible(submit_selectors, timeout_ms=2500):
+                        try:
+                            self._page.keyboard.press("Enter")
+                        except Exception:
+                            pass
+                    self._page.wait_for_timeout(1800)
+                    self._sync_browser_cookies_to_http()
+                    continue
+            self._page.wait_for_timeout(1200)
+            self._sync_browser_cookies_to_http()
+        return self._detect_browser_auth_state()
+
+    @staticmethod
+    def _consent_action_selectors():
+        return [
+            "button:has-text('Continue')",
+            "button:has-text('Continue to')",
+            "button:has-text('Allow')",
+            "button:has-text('Authorize')",
+            "button:has-text('Accept')",
+            "button:has-text('Approve')",
+            "button:has-text('Confirm')",
+            "button:has-text('Agree')",
+            "button:has-text('OK')",
+            "[role='button']:has-text('Continue')",
+            "[role='button']:has-text('Allow')",
+            "text=/continue/i",
+            "text=/allow/i",
+            "text=/authorize/i",
+            "text=/accept/i",
+            "text=/confirm/i",
+            "a:has-text('Continue')",
+            "a:has-text('Allow')",
+            "[role='link']:has-text('Continue')",
+            "button[type='submit']",
+        ]
+
+    def _click_consent_action_fallback(self, timeout_ms: int = 2500) -> bool:
+        deadline = time.time() + max(int(timeout_ms or 0), 250) / 1000.0
+        pattern = r"(continue|continue to|allow|authorize|accept|approve|confirm|agree|ok)"
+        while time.time() < deadline:
+            try:
+                clicked = self._page.evaluate(
+                    """(pattern) => {
+                        const re = new RegExp(pattern, 'i');
+                        const selectors = ['button', '[role="button"]', 'a', '[role="link"]', 'input[type="submit"]', 'input[type="button"]'];
+                        const visible = (el) => {
+                            if (!el) return false;
+                            const style = window.getComputedStyle(el);
+                            if (style.display === 'none' || style.visibility === 'hidden') return false;
+                            const rect = el.getBoundingClientRect();
+                            return rect.width > 0 && rect.height > 0;
+                        };
+                        const textOf = (el) => (
+                            el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || ''
+                        ).trim();
+                        for (const selector of selectors) {
+                            for (const el of document.querySelectorAll(selector)) {
+                                const text = textOf(el);
+                                if (!text || !re.test(text) || !visible(el)) continue;
+                                if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+                                el.click();
+                                return text;
+                            }
+                        }
+                        return '';
+                    }""",
+                    pattern,
+                )
+            except Exception:
+                clicked = ""
+            if clicked:
+                return True
+            try:
+                self._page.wait_for_timeout(200)
+            except Exception:
+                time.sleep(0.2)
+        return False
+
+    def _report_workspace_issue(
+        self,
+        reason: str,
+        consent_url: str = "",
+        session: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        current = self._abs_auth_url(getattr(self._page, "url", "")) or self._abs_auth_url(consent_url)
+        button_visible = bool(self._find_first_visible(self._consent_action_selectors(), timeout_ms=400))
+        workspace_count = len((session or {}).get("workspaces") or []) if isinstance(session, dict) else 0
+        if self._detect_browser_add_phone(f"workspace_{reason}", candidate_url=current):
+            return
+        self.oauth_fail_reason = (
+            f"{reason} (workspaces={workspace_count}, "
+            f"consent={'yes' if self._looks_like_consent_step('', current) else 'no'}, "
+            f"button={'yes' if button_visible else 'no'})"
+        )
+        self._log(
+            f"OAuth workspace issue reason={reason} workspaces={workspace_count} "
+            f"consent={'yes' if self._looks_like_consent_step('', current) else 'no'} "
+            f"button={'yes' if button_visible else 'no'} "
+            f"url={(current or '-')[:220]}",
+            "warning",
+        )
+
+    def _advance_browser_consent(
+        self,
+        consent_url: str = "",
+        referer: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        target = self._abs_auth_url(consent_url or getattr(self._page, "url", ""))
+        if target:
+            try:
+                self._browser_goto(target, referer=referer, wait_ms=1600)
+            except Exception:
+                pass
+        if self._detect_browser_add_phone("consent_open", candidate_url=target):
+            return False, None
+        if not self._click_first_visible(self._consent_action_selectors(), timeout_ms=2500):
+            if not self._click_consent_action_fallback(timeout_ms=1800):
+                return False, None
+        try:
+            self._page.wait_for_timeout(1800)
+        except Exception:
+            time.sleep(1.8)
+        self._sync_browser_cookies_to_http()
+        final = self._abs_auth_url(getattr(self._page, "url", "")) or target
+        if self._detect_browser_add_phone("consent_click", candidate_url=final):
+            return True, None
+        return True, (_extract_code_from_url(final) or self._oauth_follow_chain_for_code(final, referer=target)[0])
 
     @staticmethod
     def _is_cf_challenge_response(status: int, headers: Dict[str, str], body_text: str) -> bool:
@@ -946,8 +1476,18 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
         workspaces = session.get("workspaces") or []
         workspace_id = str(((workspaces[0] or {}).get("id")) or "").strip() if workspaces else ""
         if not workspace_id:
-            self._log("OAuth workspace id missing in auth-session cookie", "warning")
-            return None
+            clicked, code = self._advance_browser_consent(consent_url, referer=consent_url)
+            if code:
+                return code
+            if self.oauth_fail_reason == "add-phone gate":
+                return None
+            if clicked:
+                session = self._decode_auth_session_cookie() or session
+                workspaces = session.get("workspaces") or []
+                workspace_id = str(((workspaces[0] or {}).get("id")) or "").strip() if workspaces else ""
+            if not workspace_id:
+                self._report_workspace_issue("no_workspace_id", consent_url=consent_url, session=session)
+                return None
 
         headers = self._auth_headers()
         if consent_url:
@@ -1042,10 +1582,467 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
             code = self._oauth_browser_allow_redirect_code(candidate, referer=referer)
             if code:
                 return code
+            _, code = self._advance_browser_consent(candidate, referer=referer or candidate)
+            if code:
+                return code
+            if self.oauth_fail_reason == "add-phone gate":
+                return None
             code = self._oauth_submit_workspace_org_for_code(candidate)
             if code:
                 return code
+            if self.oauth_fail_reason == "add-phone gate":
+                return None
         return None
+
+    def _oauth_send_passwordless_otp(
+        self,
+        referer: Optional[str] = None,
+        step: str = "OAuth passwordless/send-otp",
+    ) -> Tuple[int, Any, str, str]:
+        resolved_referer = self._abs_auth_url(referer) or f"{self.auth_base}/log-in/password"
+        headers = self._auth_headers()
+        headers["referer"] = resolved_referer
+        headers["openai-sentinel-token"] = self._build_sentinel_token("email_otp_verification")
+        self._otp_sent_at = time.time()
+        status, data, _ = self._api(
+            "POST",
+            f"{self.auth_base}/api/accounts/passwordless/send-otp",
+            step,
+            expected=(200, 201, 400, 401, 409),
+            headers=headers,
+            json_body={},
+            allow_redirects=False,
+        )
+        next_url = self._extract_next_url(data, "")
+        page_type = self._extract_page_type(data)
+        return int(status or 0), data, self._abs_auth_url(next_url), page_type
+
+    def _oauth_resend_verification_code(self) -> bool:
+        _, current_url = self._browser_path()
+        status, data, next_url, page_type = self._oauth_send_passwordless_otp(
+            referer=current_url or f"{self.auth_base}/log-in/password",
+            step="OAuth passwordless/resend-otp",
+        )
+        if int(status or 0) in (200, 201):
+            self._oauth_passwordless_active = True
+            target = next_url or current_url
+            if target:
+                try:
+                    self._browser_goto(target, referer=current_url or f"{self.auth_base}/log-in/password", wait_ms=1200)
+                except Exception:
+                    pass
+            if self._looks_like_add_phone(page_type, next_url):
+                self._report_add_phone("oauth_resend", page_type, next_url, data)
+                return False
+            return True
+        return self._send_verification_code(referer=current_url or f"{self.auth_base}/log-in/password")
+
+    def _oauth_validate_secondary_otp(self, code: str) -> Tuple[int, Any]:
+        _, current_url = self._browser_path()
+        headers = self._auth_headers()
+        headers["referer"] = self._abs_auth_url(current_url) or f"{self.auth_base}/email-verification"
+        headers["openai-sentinel-token"] = self._build_sentinel_token("email_otp_verification")
+        status, data, _ = self._api(
+            "POST",
+            f"{self.auth_base}/api/accounts/email-otp/validate",
+            "OAuth validate OTP",
+            expected=(200, 201, 400, 401, 409),
+            headers=headers,
+            json_body={"code": str(code or "").strip()},
+            allow_redirects=False,
+        )
+        if int(status or 0) in (200, 201):
+            return int(status or 0), data
+        if self._is_invalid_state(status, data) or _payload_error_code(data) == "invalid_auth_step":
+            self._log("OAuth OTP state expired, resend once and retry same code", "warning")
+            if self._oauth_resend_verification_code():
+                retry_status, retry_data, _ = self._api(
+                    "POST",
+                    f"{self.auth_base}/api/accounts/email-otp/validate",
+                    "OAuth validate OTP retry",
+                    expected=(200, 201, 400, 401, 409),
+                    headers=headers,
+                    json_body={"code": str(code or "").strip()},
+                    allow_redirects=False,
+                )
+                return int(retry_status or 0), retry_data
+        return int(status or 0), data
+
+    def _oauth_authorize_continue(
+        self,
+        email: str,
+        referer_url: str,
+    ) -> Tuple[int, Any, str, str]:
+        headers = self._auth_headers()
+        headers["referer"] = self._abs_auth_url(referer_url) or f"{self.auth_base}/log-in"
+        headers["openai-sentinel-token"] = self._build_sentinel_token("authorize_continue")
+        status, data, _ = self._api(
+            "POST",
+            f"{self.auth_base}/api/accounts/authorize/continue",
+            "OAuth authorize/continue",
+            expected=(200, 201, 400, 401, 409),
+            headers=headers,
+            json_body={"username": {"kind": "email", "value": str(email or "").strip()}},
+            allow_redirects=False,
+        )
+        next_url = self._abs_auth_url(self._extract_next_url(data, ""))
+        page_type = self._extract_page_type(data)
+        return int(status or 0), data, next_url, page_type
+
+    def _oauth_sync_step_from_browser(
+        self,
+        start_url: str = "",
+        referer: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        target = self._abs_auth_url(start_url or getattr(self._page, "url", "") or "")
+        if target:
+            try:
+                self._browser_goto(target, referer=referer or f"{self.auth_base}/log-in", wait_ms=1200)
+            except Exception:
+                pass
+        current_url, current_state = self._detect_browser_auth_state()
+        current_url = self._abs_auth_url(current_url or getattr(self._page, "url", "") or target)
+        return current_url, str(current_state or "").strip()
+
+    def _oauth_browser_submit_email(
+        self,
+        email: str,
+        start_url: str = "",
+    ) -> Tuple[str, str]:
+        target = self._abs_auth_url(start_url or getattr(self._page, "url", "") or f"{self.auth_base}/log-in")
+        current = self._abs_auth_url(getattr(self._page, "url", "") or "")
+        if target and target != current:
+            self._browser_goto(target, referer=f"{self.auth_base}/log-in", wait_ms=1500)
+
+        email_selectors = self._auth_email_selectors()
+        submit_selectors = self._auth_submit_selectors()
+        email_submitted = False
+
+        for _ in range(6):
+            current_url, state = self._detect_browser_auth_state()
+            if state in (
+                "challenge",
+                "callback",
+                "about_you",
+                "consent",
+                "email_otp_verification",
+                "login_password",
+                "login_email_password",
+            ):
+                self._sync_browser_cookies_to_http()
+                return current_url, state
+            if self._fill_first_visible(email_selectors, email, timeout_ms=2500):
+                email_submitted = True
+                if not self._click_first_visible(submit_selectors, timeout_ms=2500):
+                    try:
+                        self._page.keyboard.press("Enter")
+                    except Exception:
+                        pass
+                self._otp_sent_at = time.time()
+                self._page.wait_for_timeout(1500)
+                self._sync_browser_cookies_to_http()
+                continue
+            if email_submitted:
+                self._page.wait_for_timeout(1000)
+                self._sync_browser_cookies_to_http()
+                continue
+            self._page.wait_for_timeout(800)
+        return self._detect_browser_auth_state()
+
+    def _perform_oauth_passwordless_flow(self) -> Optional[str]:
+        if not self.oauth_start or not self.email:
+            return None
+
+        self.oauth_fail_reason = ""
+        self._oauth_passwordless_active = False
+        self._open_fresh_browser_page(self.oauth_start.auth_url)
+        current_url = self._browser_goto(
+            self.oauth_start.auth_url,
+            referer=f"{self.chat_base}/",
+            wait_ms=1800,
+        )
+        current_url = self._abs_auth_url(current_url or self.oauth_start.auth_url)
+        current_url, page_state = self._detect_browser_auth_state()
+        current_url = self._abs_auth_url(current_url or self.oauth_start.auth_url)
+        self._log(f"OAuth V2 bootstrap state={page_state or '-'} url={current_url[:180]}")
+
+        if self._looks_like_add_phone(page_state, current_url):
+            self._report_add_phone("oauth_v2_bootstrap", page_state, current_url)
+            return None
+        if self._looks_like_challenge(page_state, current_url):
+            self.oauth_fail_reason = "cloudflare challenge loop at oauth bootstrap"
+            return None
+
+        status, data, next_url, next_state = self._oauth_authorize_continue(
+            self.email or "",
+            current_url or self.oauth_start.auth_url,
+        )
+        if int(status or 0) in (200, 201):
+            page_state = str(next_state or page_state or "").strip()
+            current_url = self._abs_auth_url(next_url or current_url)
+            if current_url:
+                current_url, browser_state = self._oauth_sync_step_from_browser(
+                    current_url,
+                    referer=current_url or self.oauth_start.auth_url,
+                )
+                page_state = str(browser_state or page_state or "").strip()
+        else:
+            self._log(f"OAuth authorize/continue returned {_payload_error_summary(data)}", "warning")
+            current_url, page_state = self._oauth_browser_submit_email(
+                self.email or "",
+                start_url=current_url or self.oauth_start.auth_url,
+            )
+            current_url = self._abs_auth_url(current_url or self.oauth_start.auth_url)
+        self._log(f"OAuth V2 post-email state={page_state or '-'} url={(current_url or '-')[:180]}")
+
+        if page_state in ("login_password", "login_email_password"):
+            raise EmailAlreadyUsedError(self.email or "")
+        if self._looks_like_add_phone(page_state, current_url):
+            self._report_add_phone("oauth_v2_post_email", page_state, current_url, data)
+            return None
+        if self._looks_like_challenge(page_state, current_url):
+            self.oauth_fail_reason = "cloudflare challenge loop at oauth email step"
+            return None
+
+        if not self._looks_like_otp_step(page_state, current_url):
+            otp_status, otp_data, otp_next, otp_state = self._oauth_send_passwordless_otp(
+                referer=current_url or f"{self.auth_base}/log-in",
+                step="OAuth passwordless/send-otp (v2)",
+            )
+            if int(otp_status or 0) in (200, 201):
+                self._oauth_passwordless_active = True
+                current_url = self._abs_auth_url(otp_next or current_url)
+                page_state = str(otp_state or page_state or "").strip()
+                if current_url:
+                    current_url, browser_state = self._oauth_sync_step_from_browser(
+                        current_url,
+                        referer=current_url or f"{self.auth_base}/log-in/password",
+                    )
+                    page_state = str(browser_state or page_state or "").strip()
+            else:
+                otp_summary = _payload_error_summary(otp_data)
+                self._log(f"OAuth V2 passwordless send-otp returned {otp_summary}", "warning")
+        self._log(f"OAuth V2 otp state={page_state or '-'} url={(current_url or '-')[:180]}")
+
+        if self._looks_like_otp_step(page_state, current_url):
+            self._otp_sent_at = time.time()
+            self._oauth_passwordless_active = True
+            self._log("[OTP][oauth-v2] waiting for OAuth verification code")
+            code, otp_phase = self._await_verification_code_with_resends(
+                self._oauth_resend_verification_code,
+                timeout_retry_log_template="OAuth V2 OTP timeout, resend attempt {attempt}",
+                non_openai_retry_log_template="OAuth V2 OTP noisy mailbox, resend attempt {attempt}",
+                timeout_retry_status_template="OAuth V2 resend attempt {attempt}",
+                non_openai_retry_status_template="OAuth V2 resend after noisy mailbox {attempt}",
+            )
+            if not code:
+                self.oauth_fail_reason = (
+                    otp_phase.error_message if otp_phase and otp_phase.error_message else "oauth otp fetch failed"
+                )
+                return None
+            validate_status, validate_data = self._oauth_validate_secondary_otp(code)
+            if int(validate_status or 0) not in (200, 201):
+                self.oauth_fail_reason = f"oauth otp validate failed: {_payload_error_summary(validate_data)}"
+                self._log(f"OAuth V2 OTP validate failed: {_payload_error_summary(validate_data)}", "warning")
+                return None
+            next_url = self._extract_next_url(validate_data, current_url)
+            next_state = self._extract_page_type(validate_data) or page_state
+            if self._looks_like_add_phone(next_state, next_url):
+                self._report_add_phone("oauth_v2_post_otp", next_state, next_url, validate_data)
+                return None
+            current_url = self._abs_auth_url(next_url or current_url)
+            if current_url:
+                current_url, browser_state = self._oauth_sync_step_from_browser(
+                    current_url,
+                    referer=current_url or f"{self.auth_base}/email-verification",
+                )
+                page_state = str(browser_state or next_state or "").strip()
+            else:
+                page_state = str(next_state or page_state or "").strip()
+        self._log(f"OAuth V2 post-otp state={page_state or '-'} url={(current_url or '-')[:180]}")
+
+        if self._looks_like_about_you(page_state, current_url):
+            create_status, created = self.create_account(self.email or "")
+            if int(create_status or 0) not in (200, 201):
+                self.oauth_fail_reason = f"oauth about-you create_account failed: {_payload_error_summary(created)}"
+                self._log(f"OAuth V2 about-you failed: {_payload_error_summary(created)}", "warning")
+                return None
+            self._append_account_checkpoint(
+                "account_created",
+                oauth=False,
+                metadata={"status": "created_passwordless"},
+            )
+            next_url = self._extract_next_url(created, current_url)
+            next_state = self._extract_page_type(created) or page_state
+            if self._looks_like_add_phone(next_state, next_url):
+                self._report_add_phone("oauth_v2_about_you", next_state, next_url, created)
+                return None
+            current_url = self._abs_auth_url(next_url or current_url)
+            if current_url:
+                current_url, browser_state = self._oauth_sync_step_from_browser(
+                    current_url,
+                    referer=current_url or f"{self.auth_base}/about-you",
+                )
+                page_state = str(browser_state or next_state or "").strip()
+        self._log(f"OAuth V2 consent state={page_state or '-'} url={(current_url or '-')[:180]}")
+
+        if self._looks_like_add_phone(page_state, current_url):
+            self._report_add_phone("oauth_v2_final", page_state, current_url)
+            return None
+
+        code = _extract_code_from_url(current_url)
+        if not code and current_url:
+            code = self._oauth_follow_chain_for_code(current_url, referer=current_url)[0]
+        if not code and self._looks_like_consent_step(page_state, current_url):
+            code = self._oauth_resolve_code(current_url, referer=current_url or self.oauth_start.auth_url)
+        if not code:
+            code = self._oauth_resolve_code("", referer=current_url or self.oauth_start.auth_url)
+        if not code:
+            self.oauth_fail_reason = self.oauth_fail_reason or "no authorization code after consent"
+            return None
+        self._log("OAuth V2 captured authorization code")
+        return self._build_callback_url_from_code(code)
+
+    def _perform_oauth_browser_flow(self) -> Optional[str]:
+        if not self.oauth_start or not self.email or not self.password:
+            return None
+
+        self.oauth_fail_reason = ""
+        self._oauth_passwordless_active = False
+        self._open_fresh_browser_page(self.oauth_start.auth_url)
+        current_url = self._browser_goto(
+            self.oauth_start.auth_url,
+            referer=f"{self.chat_base}/",
+            wait_ms=1800,
+        )
+        current_url, page_state = self._detect_browser_auth_state()
+        current_url = self._abs_auth_url(current_url or self.oauth_start.auth_url)
+        self._log(f"OAuth browser bootstrap state={page_state or '-'} url={current_url[:180]}")
+
+        if self._looks_like_add_phone(page_state, current_url):
+            self._report_add_phone("oauth_bootstrap", page_state, current_url)
+            return None
+        if self._looks_like_challenge(page_state, current_url):
+            self.oauth_fail_reason = "cloudflare challenge loop at oauth bootstrap"
+            return None
+
+        browser_url, browser_state = self._oauth_browser_authenticate(
+            self.email or "",
+            self.password or "",
+            start_url=current_url or self.oauth_start.auth_url,
+        )
+        current_url = self._abs_auth_url(browser_url or current_url or self.oauth_start.auth_url)
+        page_state = str(browser_state or page_state or "").strip()
+        self._log(f"OAuth browser auth state={page_state or '-'} url={current_url[:180]}")
+
+        if self._looks_like_add_phone(page_state, current_url):
+            self._report_add_phone("oauth_browser_auth", page_state, current_url)
+            return None
+        if self._looks_like_challenge(page_state, current_url):
+            self.oauth_fail_reason = "cloudflare challenge loop at oauth login"
+            return None
+        if page_state in ("login_email", "login_password", "login_email_password"):
+            self.oauth_fail_reason = "browser oauth login did not advance"
+            return None
+
+        if (
+            not self._looks_like_otp_step(page_state, current_url)
+            and not self._looks_like_consent_step(page_state, current_url)
+            and not self._looks_like_callback(page_state, current_url)
+            and not self._looks_like_about_you(page_state, current_url)
+        ):
+            status, data, next_url, next_state = self._oauth_send_passwordless_otp(
+                referer=current_url or f"{self.auth_base}/log-in/password",
+            )
+            if int(status or 0) in (200, 201):
+                self._oauth_passwordless_active = True
+                current_url = self._abs_auth_url(next_url or current_url)
+                page_state = str(next_state or page_state or "").strip()
+                if current_url:
+                    try:
+                        current_url = self._browser_goto(
+                            current_url,
+                            referer=browser_url or f"{self.auth_base}/log-in/password",
+                            wait_ms=1500,
+                        )
+                    except Exception:
+                        pass
+                    current_url, browser_state = self._detect_browser_auth_state()
+                    current_url = self._abs_auth_url(current_url or next_url or browser_url)
+                    page_state = str(browser_state or page_state or "").strip()
+                self._log(f"OAuth passwordless state={page_state or '-'} url={(current_url or '-')[:180]}")
+                if self._looks_like_add_phone(page_state, current_url):
+                    self._report_add_phone("oauth_passwordless", page_state, current_url, data)
+                    return None
+
+        if self._looks_like_otp_step(page_state, current_url):
+            self._otp_sent_at = time.time()
+            self._oauth_passwordless_active = True
+            self._log("[OTP][oauth] waiting for OAuth verification code")
+            code, otp_phase = self._await_verification_code_with_resends(
+                self._oauth_resend_verification_code,
+                timeout_retry_log_template="OAuth OTP timeout, resend attempt {attempt}",
+                non_openai_retry_log_template="OAuth OTP noisy mailbox, resend attempt {attempt}",
+                timeout_retry_status_template="OAuth resend attempt {attempt}",
+                non_openai_retry_status_template="OAuth resend after noisy mailbox {attempt}",
+            )
+            if not code:
+                self.oauth_fail_reason = (
+                    otp_phase.error_message if otp_phase and otp_phase.error_message else "oauth otp fetch failed"
+                )
+                return None
+            status, data = self._oauth_validate_secondary_otp(code)
+            if int(status or 0) not in (200, 201):
+                self.oauth_fail_reason = f"oauth otp validate failed: {_payload_error_summary(data)}"
+                self._log(f"OAuth OTP validate failed: {_payload_error_summary(data)}", "warning")
+                return None
+            next_url = self._extract_next_url(data, current_url)
+            next_state = self._extract_page_type(data) or page_state
+            if self._looks_like_add_phone(next_state, next_url):
+                self._report_add_phone("oauth_post_otp", next_state, next_url, data)
+                return None
+            if next_url:
+                current_url = self._browser_goto(
+                    self._abs_auth_url(next_url),
+                    referer=current_url or f"{self.auth_base}/log-in/password",
+                    wait_ms=1600,
+                )
+                current_url, browser_state = self._detect_browser_auth_state()
+                current_url = self._abs_auth_url(current_url or next_url)
+                page_state = str(browser_state or next_state or "").strip()
+            else:
+                page_state = str(next_state or page_state or "").strip()
+            self._log(f"OAuth post-otp state={page_state or '-'} url={(current_url or '-')[:180]}")
+
+        if self._looks_like_about_you(page_state, current_url):
+            self._log("OAuth landed on about-you, replaying profile create once", "warning")
+            create_status, created = self.create_account(self.email or "")
+            if int(create_status or 0) not in (200, 201) and _payload_error_code(created) != "user_already_exists":
+                self.oauth_fail_reason = f"oauth about-you create_account failed: {_payload_error_summary(created)}"
+                return None
+            next_url = self._extract_next_url(created, current_url)
+            if next_url:
+                current_url = self._browser_goto(next_url, referer=current_url or f"{self.auth_base}/about-you", wait_ms=1500)
+                current_url, browser_state = self._detect_browser_auth_state()
+                current_url = self._abs_auth_url(current_url or next_url)
+                page_state = str(browser_state or page_state or "").strip()
+
+        if self._looks_like_add_phone(page_state, current_url):
+            self._report_add_phone("oauth_final", page_state, current_url)
+            return None
+
+        code = _extract_code_from_url(current_url)
+        if not code and current_url:
+            code = self._oauth_follow_chain_for_code(current_url, referer=current_url)[0]
+        if not code and self._looks_like_consent_step(page_state, current_url):
+            code = self._oauth_resolve_code(current_url, referer=current_url or self.oauth_start.auth_url)
+        if not code:
+            code = self._oauth_resolve_code("", referer=current_url or self.oauth_start.auth_url)
+        if not code:
+            self.oauth_fail_reason = self.oauth_fail_reason or "no authorization code after consent"
+            return None
+        self._log("OAuth browser flow captured authorization code")
+        return self._build_callback_url_from_code(code)
 
     def _build_callback_url_from_code(self, code: str) -> str:
         if not self.oauth_start:
@@ -1134,6 +2131,19 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
         if not self.oauth_start:
             raise RuntimeError("oauth not initialized")
 
+        mode = self._resolved_execution_mode()
+        if mode == "playwright_v3":
+            callback_url = self._perform_oauth_browser_flow()
+            if callback_url:
+                return callback_url
+            if self.oauth_fail_reason:
+                self._log(f"OAuth browser flow fallback reason: {self.oauth_fail_reason}", "warning")
+        elif mode == "playwright_v2":
+            callback_url = self._perform_oauth_passwordless_flow()
+            if callback_url:
+                return callback_url
+            raise RuntimeError(self.oauth_fail_reason or "oauth authorization code not captured")
+
         _, _, response = self._api(
             "GET",
             self.oauth_start.auth_url,
@@ -1196,6 +2206,84 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
         result = RegistrationResult(success=False, logs=self.logs)
 
         try:
+            self._raise_if_cancelled()
+            self._log("=" * 60)
+            self._log("Start Playwright V2 OAuth-first flow")
+            self._log("=" * 60)
+
+            self._emit_status("ip_check", "Check IP location", step_index=1)
+            ip_ok, location = self._check_ip_location()
+            if not ip_ok:
+                result.error_message = f"IP region unsupported: {location}"
+                return result
+
+            self._emit_status("email_prepare", "Create email address", step_index=2)
+            if not self._phase_email_prepare():
+                phase = self._get_phase_result("email_prepare")
+                result.error_message = phase.error_message if phase else "Email creation failed"
+                result.error_code = phase.error_code if phase else ""
+                return result
+            result.email = self.email
+            self.password = ""
+
+            self._emit_status("session_init", "Initialize browser session", step_index=3)
+            if not self._init_session():
+                result.error_message = "Session initialization failed"
+                return result
+
+            self._emit_status("oauth_start", "Initialize OAuth parameters", step_index=4)
+            if not self._start_oauth():
+                result.error_message = "Initialize OAuth failed"
+                return result
+
+            self._emit_status("oauth_flow", "Run direct OAuth passwordless flow", step_index=5)
+            callback_url = self.perform_oauth()
+
+            self._emit_status("oauth_callback", "Handle OAuth callback", step_index=6)
+            token_info = self._handle_oauth_callback(callback_url)
+            if not token_info:
+                result.error_message = "OAuth callback handling failed"
+                return result
+
+            auth_session = self._decode_auth_session_cookie() or {}
+            result.workspace_id = (
+                self._extract_workspace_id_from_auth_json(auth_session)
+                or result.workspace_id
+            )
+
+            result.success = True
+            result.account_id = str(token_info.get("account_id") or "")
+            result.access_token = str(token_info.get("access_token") or "")
+            result.refresh_token = str(token_info.get("refresh_token") or "")
+            result.id_token = str(token_info.get("id_token") or "")
+            result.password = ""
+            result.source = "register"
+            result.cookies = self._compose_cookie_string()
+
+            session_cookie = self.session.cookies.get("__Secure-next-auth.session-token")
+            if session_cookie:
+                result.session_token = session_cookie
+
+            result.metadata = {
+                "email_service": self.email_service.service_type.value,
+                "proxy_used": self.proxy_url,
+                "registered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "registration_mode": self._resolved_execution_mode(),
+                "oauth_flow": "passwordless",
+            }
+            self._append_account_checkpoint(
+                "oauth_success",
+                oauth=True,
+                metadata={
+                    "source": result.source,
+                    "account_id": result.account_id,
+                    "workspace_id": result.workspace_id,
+                    "status": "oauth_success",
+                    "oauth_flow": "passwordless",
+                },
+            )
+            return result
+
             self._raise_if_cancelled()
             self._log("=" * 60)
             self._log("开始 Playwright 注册流程")
