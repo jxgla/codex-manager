@@ -40,6 +40,7 @@ def test_run_batch_parallel_keeps_counter_updates_in_sync(monkeypatch):
         proxy,
         email_service_config,
         email_service_id,
+        engine_mode="playwright_v2",
         log_prefix="",
         batch_id="",
         auto_upload_cpa=False,
@@ -48,6 +49,8 @@ def test_run_batch_parallel_keeps_counter_updates_in_sync(monkeypatch):
         sub2api_service_ids=None,
         auto_upload_tm=False,
         tm_service_ids=None,
+        auto_upload_newapi=False,
+        newapi_service_ids=None,
     ):
         assert task_uuid in task_statuses
 

@@ -2,7 +2,12 @@ x-webui-port: &webui-port 15555
 
 services:
   webui:
-    build: .
+    image: codex-manager-webui:local
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile
+      pull: false
     ports:
       - target: *webui-port
         published: *webui-port

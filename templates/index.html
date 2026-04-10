@@ -188,6 +188,17 @@
                                 </div>
 
                                 <!-- Outlook 批量注册区域 -->
+                                <div class="form-group">
+                                    <label for="engine-mode">注册引擎</label>
+                                    <select id="engine-mode" name="engine_mode">
+                                        <option value="playwright_v2" selected>Playwright V2</option>
+                                        <option value="legacy">Legacy</option>
+                                    </select>
+                                    <small style="color: var(--text-muted); font-size: 0.75rem;">
+                                        新流程默认使用 Playwright V2，旧协议保留为 Legacy。
+                                    </small>
+                                </div>
+
                                 <div id="outlook-batch-section" style="display: none;">
                                     <div class="form-group">
                                         <label>选择账户</label>

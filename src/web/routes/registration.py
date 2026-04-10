@@ -24,6 +24,7 @@ from ...core.register import (
     RegistrationEngine,
     RegistrationResult,
 )
+from ...core.registration_factory import create_registration_engine, normalize_engine_mode
 from ...services import EmailServiceFactory, EmailServiceType
 from ...services.base import BaseEmailService, EmailProviderBackoffState, OTPTimeoutEmailServiceError
 from ...config.settings import get_settings
@@ -113,6 +114,7 @@ def disable_proxy_for_network_error(db, proxy_id: Optional[int], reason: str) ->
 class RegistrationTaskCreate(BaseModel):
     """创建注册任务请求"""
     email_service_type: str = "tempmail"
+    engine_mode: str = "playwright_v2"
     proxy: Optional[str] = None
     email_service_config: Optional[dict] = None
     email_service_id: Optional[int] = None
@@ -130,6 +132,7 @@ class BatchRegistrationRequest(BaseModel):
     """批量注册请求"""
     count: int = 1
     email_service_type: str = "tempmail"
+    engine_mode: str = "playwright_v2"
     proxy: Optional[str] = None
     email_service_config: Optional[dict] = None
     email_service_id: Optional[int] = None
@@ -215,6 +218,7 @@ class OutlookAccountsListResponse(BaseModel):
 class OutlookBatchRegistrationRequest(BaseModel):
     """Outlook 批量注册请求"""
     service_ids: List[int]
+    engine_mode: str = "playwright_v2"
     skip_registered: bool = True
     proxy: Optional[str] = None
     interval_min: int = 5
@@ -378,6 +382,7 @@ def _run_registration_engine_attempt(
     actual_proxy_url: Optional[str],
     log_callback,
     db_service,
+    engine_mode: str = "playwright_v2",
     status_callback=None,
 ):
     """执行单次注册引擎尝试，并在同一临界区内维护邮箱服务退避状态。"""
@@ -389,7 +394,8 @@ def _run_registration_engine_attempt(
             if hasattr(email_service, "apply_provider_backoff_state"):
                 email_service.apply_provider_backoff_state(provider_backoff_before_run)
 
-        engine = RegistrationEngine(
+        engine = create_registration_engine(
+            mode=engine_mode,
             email_service=email_service,
             proxy_url=actual_proxy_url,
             callback_logger=log_callback,
@@ -604,7 +610,7 @@ def _build_email_service_candidates(
     return candidates
 
 
-def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None, auto_upload_newapi: bool = False, newapi_service_ids: List[int] = None):
+def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, engine_mode: str = "playwright_v2", log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None, auto_upload_newapi: bool = False, newapi_service_ids: List[int] = None):
     """
     在线程池中执行的同步注册任务
 
@@ -632,6 +638,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
             task_manager.update_status(task_uuid, "running")
             log_callback = task_manager.create_log_callback(task_uuid, prefix=log_prefix, batch_id=batch_id)
             requested_service_type = EmailServiceType(email_service_type)
+            resolved_engine_mode = normalize_engine_mode(engine_mode)
             requested_proxy = proxy
             exhausted_proxy_ids = set()
             result = RegistrationResult(success=False, logs=[])
@@ -711,6 +718,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         actual_proxy_url=actual_proxy_url,
                         log_callback=log_callback,
                         db_service=db_service,
+                        engine_mode=resolved_engine_mode,
                         status_callback=status_callback,
                     )
 
@@ -991,7 +999,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 pass
 
 
-async def run_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None, auto_upload_newapi: bool = False, newapi_service_ids: List[int] = None):
+async def run_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, engine_mode: str = "playwright_v2", log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None, auto_upload_newapi: bool = False, newapi_service_ids: List[int] = None):
     """
     异步执行注册任务
 
@@ -1021,6 +1029,7 @@ async def run_registration_task(task_uuid: str, email_service_type: str, proxy: 
             proxy,
             email_service_config,
             email_service_id,
+            engine_mode,
             log_prefix,
             batch_id,
             auto_upload_cpa,
@@ -1331,6 +1340,7 @@ async def run_batch_parallel(
     email_service_config: Optional[dict],
     email_service_id: Optional[int],
     concurrency: int,
+    engine_mode: str = "playwright_v2",
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
     auto_upload_sub2api: bool = False,
@@ -1353,7 +1363,7 @@ async def run_batch_parallel(
         prefix = f"[任务{idx + 1}]"
         async with semaphore:
             await run_registration_task(
-                uuid, email_service_type, proxy, email_service_config, email_service_id,
+                uuid, email_service_type, proxy, email_service_config, email_service_id, engine_mode,
                 log_prefix=prefix, batch_id=batch_id,
                 auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids or [],
                 auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids or [],
@@ -1403,6 +1413,7 @@ async def run_batch_pipeline(
     interval_min: int,
     interval_max: int,
     concurrency: int,
+    engine_mode: str = "playwright_v2",
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
     auto_upload_sub2api: bool = False,
@@ -1425,7 +1436,7 @@ async def run_batch_pipeline(
     async def _run_and_release(idx: int, uuid: str, pfx: str):
         try:
             await run_registration_task(
-                uuid, email_service_type, proxy, email_service_config, email_service_id,
+                uuid, email_service_type, proxy, email_service_config, email_service_id, engine_mode,
                 log_prefix=pfx, batch_id=batch_id,
                 auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids or [],
                 auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids or [],
@@ -1499,6 +1510,7 @@ async def run_batch_registration(
     interval_max: int,
     concurrency: int = 1,
     mode: str = "pipeline",
+    engine_mode: str = "playwright_v2",
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
     auto_upload_sub2api: bool = False,
@@ -1513,6 +1525,7 @@ async def run_batch_registration(
         await run_batch_parallel(
             batch_id, task_uuids, email_service_type, proxy,
             email_service_config, email_service_id, concurrency,
+            engine_mode=engine_mode,
             auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids,
             auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids,
             auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids,
@@ -1523,6 +1536,7 @@ async def run_batch_registration(
             batch_id, task_uuids, email_service_type, proxy,
             email_service_config, email_service_id,
             interval_min, interval_max, concurrency,
+            engine_mode=engine_mode,
             auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids,
             auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids,
             auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids,
@@ -1613,6 +1627,10 @@ async def start_registration(
         )
 
     # 在后台运行注册任务
+    try:
+        engine_mode = normalize_engine_mode(request.engine_mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     background_tasks.add_task(
         run_registration_task,
         task_uuid,
@@ -1620,6 +1638,7 @@ async def start_registration(
         request.proxy,
         request.email_service_config,
         request.email_service_id,
+        engine_mode,
         "",
         "",
         request.auto_upload_cpa,
@@ -1661,6 +1680,11 @@ async def start_batch_registration(
             detail=f"无效的邮箱服务类型: {request.email_service_type}"
         )
 
+    try:
+        engine_mode = normalize_engine_mode(request.engine_mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     if request.interval_min < 0 or request.interval_max < request.interval_min:
         raise HTTPException(status_code=400, detail="间隔时间参数无效")
 
@@ -1701,6 +1725,7 @@ async def start_batch_registration(
         request.interval_max,
         request.concurrency,
         request.mode,
+        engine_mode,
         request.auto_upload_cpa,
         request.cpa_service_ids,
         request.auto_upload_sub2api,
@@ -2118,6 +2143,7 @@ async def run_outlook_batch_registration(
     interval_max: int,
     concurrency: int = 1,
     mode: str = "pipeline",
+    engine_mode: str = "playwright_v2",
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
     auto_upload_sub2api: bool = False,
@@ -2159,6 +2185,7 @@ async def run_outlook_batch_registration(
         proxy=proxy,
         email_service_config=None,
         email_service_id=None,   # 每个任务已绑定了独立的 email_service_id
+        engine_mode=engine_mode,
         interval_min=interval_min,
         interval_max=interval_max,
         concurrency=concurrency,
@@ -2253,6 +2280,10 @@ async def start_outlook_batch_registration(
     )
 
     # 在后台运行批量注册
+    try:
+        engine_mode = normalize_engine_mode(request.engine_mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     background_tasks.add_task(
         run_outlook_batch_registration,
         batch_id,
@@ -2263,6 +2294,7 @@ async def start_outlook_batch_registration(
         request.interval_max,
         request.concurrency,
         request.mode,
+        engine_mode,
         request.auto_upload_cpa,
         request.cpa_service_ids,
         request.auto_upload_sub2api,

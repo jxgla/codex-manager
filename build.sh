@@ -25,7 +25,7 @@ case "$OS" in
     ;;
 esac
 
-OUTPUT_NAME="codex-register-${PLATFORM}-${ARCH}${EXT}"
+OUTPUT_NAME="codex-manager-webui-${PLATFORM}-${ARCH}${EXT}"
 
 echo "=== 构建平台: ${PLATFORM} (${ARCH}) ==="
 echo "=== 输出文件: dist/${OUTPUT_NAME} ==="
@@ -36,14 +36,14 @@ pip install pyinstaller --quiet 2>/dev/null || \
 
 # 执行打包（优先用 uv，回退到直接调用）
 if command -v uv &>/dev/null; then
-  uv run --with pyinstaller pyinstaller codex_register.spec --clean --noconfirm
+  uv run --with pyinstaller pyinstaller codex_manager_webui.spec --clean --noconfirm
 else
-  pyinstaller codex_register.spec --clean --noconfirm
+  pyinstaller codex_manager_webui.spec --clean --noconfirm
 fi
 
 # 重命名输出文件
-mv dist/codex-register${EXT} dist/${OUTPUT_NAME} 2>/dev/null || \
-  mv "dist/codex-register" "dist/${OUTPUT_NAME}" 2>/dev/null || true
+mv dist/codex-manager-webui${EXT} dist/${OUTPUT_NAME} 2>/dev/null || \
+  mv "dist/codex-manager-webui" "dist/${OUTPUT_NAME}" 2>/dev/null || true
 
 echo "=== 构建完成: dist/${OUTPUT_NAME} ==="
 ls -lh dist/${OUTPUT_NAME}

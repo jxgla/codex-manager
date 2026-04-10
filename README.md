@@ -139,7 +139,7 @@ python webui.py --host 0.0.0.0 --port 8080 --access-password mypassword
 
 > `--access-password` 优先级高于数据库中保存的密钥设置，每次启动时生效。打包后的 exe 同样支持此参数：
 > ```bash
-> codex-register.exe --access-password mypassword
+> codex-manager-webui.exe --access-password mypassword
 > ```
 
 ### Docker 部署
@@ -151,8 +151,9 @@ python webui.py --host 0.0.0.0 --port 8080 --access-password mypassword
 在项目根目录下，直接使用 `docker-compose` 启动：
 
 ```bash
-docker-compose up -d
+docker compose up -d --build
 ```
+默认 `docker-compose.yml` 现在固定使用本地镜像 `codex-manager-webui:local`，不会再自动拉取旧的远端应用镜像。
 你可以在 `docker-compose.yml` 中修改相关的环境变量，例如配置端口或者设置 `WEBUI_ACCESS_PASSWORD` 访问密码。
 
 如果要修改 Docker Compose 对外端口，直接改文件顶部这一行即可：
@@ -172,14 +173,16 @@ x-webui-port: &webui-port 15555
 如果你不想使用 docker-compose，也可以直接拉取并运行镜像：
 
 ```bash
+docker build -t codex-manager-webui:local .
+
 docker run -d \
   -p 15555:15555 \
   -e WEBUI_HOST=0.0.0.0 \
   -e WEBUI_PORT=15555 \
   -e WEBUI_ACCESS_PASSWORD=your_secure_password \
   -v $(pwd)/data:/app/data \
-  --name codex-register \
-  ghcr.io/yunxilyf/codex-register:latest
+  --name codex-manager-webui \
+  codex-manager-webui:local
 ```
 
 环境变量说明：
@@ -194,14 +197,16 @@ docker run -d \
 如果你要把容器端口改成 `18080`，`-p` 和 `WEBUI_PORT` 需要一起改：
 
 ```bash
+docker build -t codex-manager-webui:local .
+
 docker run -d \
   -p 18080:18080 \
   -e WEBUI_HOST=0.0.0.0 \
   -e WEBUI_PORT=18080 \
   -e WEBUI_ACCESS_PASSWORD=your_secure_password \
   -v $(pwd)/data:/app/data \
-  --name codex-register \
-  ghcr.io/yunxilyf/codex-register:latest
+  --name codex-manager-webui \
+  codex-manager-webui:local
 ```
 
 ### 使用远程 PostgreSQL
@@ -227,12 +232,12 @@ build.bat
 bash build.sh
 ```
 
-打包后生成 `codex-register.exe`（Windows）或 `codex-register`（Unix），双击或直接运行即可，无需安装 Python 环境。
+打包后生成 `codex-manager-webui.exe`（Windows）或 `codex-manager-webui`（Unix），双击或直接运行即可，无需安装 Python 环境。
 
 ## 项目结构
 
 ```
-codex-register-v2/
+codex-manager/
 ├── webui.py            # Web UI 入口
 ├── build.bat           # Windows 打包脚本
 ├── build.sh            # Linux/macOS 打包脚本
@@ -363,11 +368,11 @@ codex-register-v2/
 
 ```bash
 # 克隆项目
-git clone https://github.com/cnlimiter/codex-register.git
-cd codex-register
+git clone <your-repository-url> codex-manager
+cd codex-manager
 
 # 启动服务
-docker-compose up -d
+docker compose up -d --build
 ```
 
 服务启动后访问 http://localhost:15555
