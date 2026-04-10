@@ -15,7 +15,7 @@ from .register import RegistrationResult, TaskCancelledError
 from .register_playwright import (
     EmailAlreadyUsedError,
     PlaywrightRegistrationEngine,
-    _payload_error_code,
+    _payload_error_summary,
 )
 
 
@@ -69,7 +69,9 @@ class PlaywrightRegistrationEngineV3(PlaywrightRegistrationEngine):
                 current_path, _ = self._browser_path()
                 if "log-in/password" in current_path:
                     raise EmailAlreadyUsedError(self.email or "")
-                result.error_message = f"Register failed: {_payload_error_code(register_data) or register_data}"
+                error_summary = _payload_error_summary(register_data)
+                self._log(f"提交注册失败详情: {error_summary}", "error")
+                result.error_message = f"注册失败: {error_summary}"
                 return result
 
             self._emit_status("otp_send", "Send OTP email", step_index=6)

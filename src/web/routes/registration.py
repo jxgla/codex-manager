@@ -24,7 +24,11 @@ from ...core.register import (
     RegistrationEngine,
     RegistrationResult,
 )
-from ...core.registration_factory import create_registration_engine, normalize_engine_mode
+from ...core.registration_factory import (
+    DEFAULT_ENGINE_MODE,
+    create_registration_engine,
+    normalize_engine_mode,
+)
 from ...services import EmailServiceFactory, EmailServiceType
 from ...services.base import BaseEmailService, EmailProviderBackoffState, OTPTimeoutEmailServiceError
 from ...config.settings import get_settings
@@ -114,7 +118,7 @@ def disable_proxy_for_network_error(db, proxy_id: Optional[int], reason: str) ->
 class RegistrationTaskCreate(BaseModel):
     """创建注册任务请求"""
     email_service_type: str = "tempmail"
-    engine_mode: str = "playwright_v2"
+    engine_mode: str = DEFAULT_ENGINE_MODE
     proxy: Optional[str] = None
     email_service_config: Optional[dict] = None
     email_service_id: Optional[int] = None
@@ -132,7 +136,7 @@ class BatchRegistrationRequest(BaseModel):
     """批量注册请求"""
     count: int = 1
     email_service_type: str = "tempmail"
-    engine_mode: str = "playwright_v2"
+    engine_mode: str = DEFAULT_ENGINE_MODE
     proxy: Optional[str] = None
     email_service_config: Optional[dict] = None
     email_service_id: Optional[int] = None
@@ -218,7 +222,7 @@ class OutlookAccountsListResponse(BaseModel):
 class OutlookBatchRegistrationRequest(BaseModel):
     """Outlook 批量注册请求"""
     service_ids: List[int]
-    engine_mode: str = "playwright_v2"
+    engine_mode: str = DEFAULT_ENGINE_MODE
     skip_registered: bool = True
     proxy: Optional[str] = None
     interval_min: int = 5
@@ -382,7 +386,7 @@ def _run_registration_engine_attempt(
     actual_proxy_url: Optional[str],
     log_callback,
     db_service,
-    engine_mode: str = "playwright_v2",
+    engine_mode: str = DEFAULT_ENGINE_MODE,
     status_callback=None,
 ):
     """执行单次注册引擎尝试，并在同一临界区内维护邮箱服务退避状态。"""
@@ -610,7 +614,7 @@ def _build_email_service_candidates(
     return candidates
 
 
-def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, engine_mode: str = "playwright_v2", log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None, auto_upload_newapi: bool = False, newapi_service_ids: List[int] = None):
+def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, engine_mode: str = DEFAULT_ENGINE_MODE, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None, auto_upload_newapi: bool = False, newapi_service_ids: List[int] = None):
     """
     在线程池中执行的同步注册任务
 
@@ -999,7 +1003,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 pass
 
 
-async def run_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, engine_mode: str = "playwright_v2", log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None, auto_upload_newapi: bool = False, newapi_service_ids: List[int] = None):
+async def run_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, engine_mode: str = DEFAULT_ENGINE_MODE, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None, auto_upload_newapi: bool = False, newapi_service_ids: List[int] = None):
     """
     异步执行注册任务
 
@@ -1340,7 +1344,7 @@ async def run_batch_parallel(
     email_service_config: Optional[dict],
     email_service_id: Optional[int],
     concurrency: int,
-    engine_mode: str = "playwright_v2",
+    engine_mode: str = DEFAULT_ENGINE_MODE,
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
     auto_upload_sub2api: bool = False,
@@ -1413,7 +1417,7 @@ async def run_batch_pipeline(
     interval_min: int,
     interval_max: int,
     concurrency: int,
-    engine_mode: str = "playwright_v2",
+    engine_mode: str = DEFAULT_ENGINE_MODE,
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
     auto_upload_sub2api: bool = False,
@@ -1510,7 +1514,7 @@ async def run_batch_registration(
     interval_max: int,
     concurrency: int = 1,
     mode: str = "pipeline",
-    engine_mode: str = "playwright_v2",
+    engine_mode: str = DEFAULT_ENGINE_MODE,
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
     auto_upload_sub2api: bool = False,
@@ -2143,7 +2147,7 @@ async def run_outlook_batch_registration(
     interval_max: int,
     concurrency: int = 1,
     mode: str = "pipeline",
-    engine_mode: str = "playwright_v2",
+    engine_mode: str = DEFAULT_ENGINE_MODE,
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
     auto_upload_sub2api: bool = False,

@@ -11,7 +11,7 @@ from .register import RegistrationEngine
 from .register_playwright import PlaywrightRegistrationEngine
 from .register_playwright_v3 import PlaywrightRegistrationEngineV3
 
-DEFAULT_ENGINE_MODE = "playwright_v2"
+DEFAULT_ENGINE_MODE = "playwright_v3"
 SUPPORTED_ENGINE_MODES = {"legacy", "playwright_v2", "playwright_v3"}
 
 
@@ -21,9 +21,9 @@ def normalize_engine_mode(mode: Optional[str]) -> str:
         "curl": "legacy",
         "curl_cffi": "legacy",
         "legacy_v1": "legacy",
-        "playwright": "playwright_v2",
+        "playwright": "playwright_v3",
         "playwrightv2": "playwright_v2",
-        "browser": "playwright_v2",
+        "browser": "playwright_v3",
         "playwright_v3": "playwright_v3",
         "playwrightv3": "playwright_v3",
         "browser_v3": "playwright_v3",

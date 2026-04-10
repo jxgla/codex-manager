@@ -579,6 +579,7 @@ class RegistrationEngine:
             self._log(f"提交注册表单状态: {response.status_code}")
 
             if response.status_code != 200:
+                self._log(f"提交注册表单失败详情: {response.text[:500]}", "warning")
                 return SignupFormResult(
                     success=False,
                     error_message=f"HTTP {response.status_code}: {response.text[:200]}"
@@ -641,6 +642,7 @@ class RegistrationEngine:
 
             if response.status_code != 200:
                 error_text = response.text[:500]
+                self._log(f"提交密码失败详情: {error_text}", "warning")
                 self._log(f"密码注册失败: {error_text}", "warning")
 
                 # 解析错误信息，判断是否是邮箱已注册

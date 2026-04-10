@@ -14,7 +14,7 @@ import secrets
 import time
 import uuid
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from ..config.constants import generate_random_user_info
 from ..config.settings import get_settings
@@ -82,10 +82,26 @@ def _b64url_no_pad(raw: bytes) -> str:
 
 
 def _extract_code_from_url(url: str) -> Optional[str]:
-    if not url:
+    raw = str(url or "").strip()
+    if not raw:
         return None
-    values = parse_qs(urlparse(str(url)).query).get("code") or []
-    return values[0] if values else None
+    candidate = raw
+    if "://" not in candidate:
+        if candidate.startswith("?"):
+            candidate = f"http://localhost{candidate}"
+        elif any(ch in candidate for ch in "/?#") or ":" in candidate:
+            candidate = f"http://{candidate}"
+        elif "=" in candidate:
+            candidate = f"http://localhost/?{candidate}"
+    parsed = urlparse(candidate)
+    for chunk in (parsed.query, parsed.fragment):
+        values = parse_qs(chunk, keep_blank_values=True).get("code") or []
+        if values and str(values[0] or "").strip():
+            return str(values[0]).strip()
+    values = parse_qs(raw.lstrip("?"), keep_blank_values=True).get("code") or []
+    if values and str(values[0] or "").strip():
+        return str(values[0]).strip()
+    return None
 
 
 def _payload_error_code(data: Any) -> str:
@@ -101,6 +117,26 @@ def _payload_error_code(data: Any) -> str:
         if value:
             return value
     return ""
+
+
+def _payload_error_summary(data: Any) -> str:
+    if isinstance(data, dict):
+        error_obj = data.get("error")
+        if isinstance(error_obj, dict):
+            code = str(error_obj.get("code") or "").strip()
+            message = str(error_obj.get("message") or "").strip()
+            if code and message:
+                return f"{code}: {message}"
+            if message:
+                return message
+            if code:
+                return code
+        for key in ("message", "detail", "text", "error_description"):
+            value = str(data.get(key) or "").strip()
+            if value:
+                return value
+        return json.dumps(data, ensure_ascii=False)[:500]
+    return str(data or "").strip()[:500]
 
 
 def _random_browser_profile(rng: random.Random) -> Dict[str, Any]:
@@ -522,14 +558,17 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
         except Exception:
             data = {"text": str(getattr(response, "text", "") or "")[:300]}
 
-        if status in expected:
+        compact = json.dumps(
+            data if isinstance(data, dict) else {"text": str(data)},
+            ensure_ascii=False,
+        )
+
+        if status in expected and 200 <= status < 300:
             self._log(f"{step} 成功 (HTTP {status})")
+        elif status in expected:
+            self._log(f"{step} 返回 HTTP {status}: {compact[:500]}", "warning")
         else:
-            compact = json.dumps(
-                data if isinstance(data, dict) else {"text": str(data)},
-                ensure_ascii=False,
-            )
-            self._log(f"{step} 失败: HTTP {status} {compact[:260]}", "warning")
+            self._log(f"{step} 失败: HTTP {status} {compact[:500]}", "warning")
         return status, data, response
 
     def _build_sentinel_token(self, label: str) -> str:
@@ -842,6 +881,185 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
             final = match.group(1) if match else str(getattr(self._page, "url", "") or "")
         return final if self._is_callback_url(final) else None
 
+    def _oauth_follow_chain_for_code(
+        self,
+        start_url: str,
+        referer: Optional[str] = None,
+        max_hops: int = 12,
+    ) -> Tuple[Optional[str], str]:
+        current = self._abs_auth_url(start_url)
+        last = current
+        headers = {
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "upgrade-insecure-requests": "1",
+        }
+        if referer:
+            headers["referer"] = self._abs_auth_url(referer)
+        for hop in range(max(int(max_hops or 12), 1)):
+            status, _, response = self._api(
+                "GET",
+                current,
+                f"OAuth follow[{hop + 1}]",
+                expected=(200, 301, 302, 303, 307, 308),
+                headers=headers,
+                allow_redirects=False,
+            )
+            last = str(getattr(response, "url", "") or current)
+            code = _extract_code_from_url(last)
+            if code:
+                self._log(f"OAuth code captured from follow url: {last[:180]}")
+                return code, last
+            location = self._abs_auth_url(
+                str((getattr(response, "headers", {}) or {}).get("location") or "").strip()
+            )
+            if location:
+                code = _extract_code_from_url(location)
+                if code:
+                    self._log(f"OAuth code captured from redirect location: {location[:180]}")
+                    return code, location
+            if int(status or 0) not in (301, 302, 303, 307, 308) or not location:
+                break
+            headers["referer"] = last
+            current = location
+        return None, last
+
+    def _oauth_browser_allow_redirect_code(
+        self,
+        url: str,
+        referer: Optional[str] = None,
+    ) -> Optional[str]:
+        target = self._abs_auth_url(url)
+        if not target:
+            return None
+        try:
+            final = self._browser_goto(target, referer=referer, wait_ms=1200)
+        except Exception as exc:
+            match = re.search(r"(https?://localhost[^\s'\"<>]+)", str(exc))
+            final = match.group(1) if match else str(getattr(self._page, "url", "") or "")
+        code = _extract_code_from_url(final)
+        if code:
+            self._log(f"OAuth code captured from browser redirect: {str(final)[:180]}")
+        return code
+
+    def _oauth_submit_workspace_org_for_code(self, consent_url: str) -> Optional[str]:
+        session = self._decode_auth_session_cookie() or {}
+        workspaces = session.get("workspaces") or []
+        workspace_id = str(((workspaces[0] or {}).get("id")) or "").strip() if workspaces else ""
+        if not workspace_id:
+            self._log("OAuth workspace id missing in auth-session cookie", "warning")
+            return None
+
+        headers = self._auth_headers()
+        if consent_url:
+            headers["referer"] = self._abs_auth_url(consent_url)
+
+        status, data, response = self._api(
+            "POST",
+            f"{self.auth_base}/api/accounts/workspace/select",
+            "OAuth workspace/select",
+            expected=(200, 201, 301, 302, 303, 307, 308, 400),
+            headers=headers,
+            json_body={"workspace_id": workspace_id},
+            allow_redirects=False,
+        )
+        location = self._abs_auth_url(
+            str((getattr(response, "headers", {}) or {}).get("location") or "").strip()
+        )
+        if location:
+            return (
+                _extract_code_from_url(location)
+                or self._oauth_follow_chain_for_code(location, referer=headers.get("referer"))[0]
+                or self._oauth_browser_allow_redirect_code(location, referer=headers.get("referer"))
+            )
+        if int(status or 0) not in (200, 201) or not isinstance(data, dict):
+            return None
+
+        next_url = self._abs_auth_url(str(data.get("continue_url") or "").strip())
+        orgs = ((data.get("data") or {}).get("orgs")) or []
+        if orgs and isinstance(orgs[0], dict) and str(orgs[0].get("id") or "").strip():
+            org_payload = {"org_id": str(orgs[0].get("id") or "").strip()}
+            projects = (orgs[0] or {}).get("projects") or []
+            if projects and isinstance(projects[0], dict) and str(projects[0].get("id") or "").strip():
+                org_payload["project_id"] = str(projects[0].get("id") or "").strip()
+            org_headers = dict(headers)
+            if next_url:
+                org_headers["referer"] = next_url
+            status2, data2, response2 = self._api(
+                "POST",
+                f"{self.auth_base}/api/accounts/organization/select",
+                "OAuth organization/select",
+                expected=(200, 201, 301, 302, 303, 307, 308, 400),
+                headers=org_headers,
+                json_body=org_payload,
+                allow_redirects=False,
+            )
+            location2 = self._abs_auth_url(
+                str((getattr(response2, "headers", {}) or {}).get("location") or "").strip()
+            )
+            if location2:
+                return (
+                    _extract_code_from_url(location2)
+                    or self._oauth_follow_chain_for_code(location2, referer=org_headers.get("referer"))[0]
+                    or self._oauth_browser_allow_redirect_code(location2, referer=org_headers.get("referer"))
+                )
+            if int(status2 or 0) in (200, 201) and isinstance(data2, dict):
+                next_url = self._abs_auth_url(str(data2.get("continue_url") or next_url or "").strip())
+        if next_url:
+            return (
+                _extract_code_from_url(next_url)
+                or self._oauth_follow_chain_for_code(next_url, referer=headers.get("referer"))[0]
+                or self._oauth_browser_allow_redirect_code(next_url, referer=headers.get("referer"))
+            )
+        return None
+
+    def _oauth_resolve_code(
+        self,
+        consent_url: str = "",
+        referer: Optional[str] = None,
+    ) -> Optional[str]:
+        candidates = []
+        seen = set()
+        for raw in (
+            consent_url,
+            getattr(self._page, "url", ""),
+            self._last_browser_url,
+            f"{self.auth_base}/sign-in-with-chatgpt/codex/consent",
+        ):
+            candidate = self._abs_auth_url(raw)
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            candidates.append(candidate)
+
+        for candidate in candidates:
+            self._log(f"OAuth resolve candidate: {candidate[:180]}")
+            code = _extract_code_from_url(candidate)
+            if code:
+                return code
+            code, _ = self._oauth_follow_chain_for_code(candidate, referer=referer)
+            if code:
+                return code
+            code = self._oauth_browser_allow_redirect_code(candidate, referer=referer)
+            if code:
+                return code
+            code = self._oauth_submit_workspace_org_for_code(candidate)
+            if code:
+                return code
+        return None
+
+    def _build_callback_url_from_code(self, code: str) -> str:
+        if not self.oauth_start:
+            raise RuntimeError("oauth not initialized")
+        redirect_uri = str(self.oauth_start.redirect_uri or "").strip() or "http://localhost/callback"
+        query = urlencode(
+            {
+                "code": str(code or "").strip(),
+                "state": str(self.oauth_start.state or "").strip(),
+            }
+        )
+        sep = "&" if "?" in redirect_uri else "?"
+        return f"{redirect_uri}{sep}{query}"
+
     def _oauth_submit_workspace_org(self, consent_url: str) -> Optional[str]:
         session = self._decode_auth_session_cookie() or {}
         workspaces = session.get("workspaces") or []
@@ -926,6 +1144,10 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
         location = self._abs_auth_url(
             str((getattr(response, "headers", {}) or {}).get("location") or "").strip()
         )
+        if not location:
+            location = self._abs_auth_url(str(getattr(response, "url", "") or "").strip())
+        if location:
+            self._log(f"OAuth bootstrap location: {location[:180]}")
         if self._is_callback_url(location):
             return location
         callback_url = (
@@ -933,8 +1155,19 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
             or self._oauth_browser_allow_redirect_callback(location or self.oauth_start.auth_url, referer=self.oauth_start.auth_url)
             or self._oauth_submit_workspace_org(location or self.oauth_start.auth_url)
         )
-        if not callback_url:
-            raise RuntimeError("oauth callback url not captured")
+        if callback_url:
+            if "state=" not in callback_url:
+                sep = "&" if "?" in callback_url else "?"
+                callback_url = f"{callback_url}{sep}state={self.oauth_start.state}"
+            return callback_url
+
+        code = _extract_code_from_url(location) if location else None
+        if not code:
+            code = self._oauth_resolve_code(location or self.oauth_start.auth_url, referer=self.oauth_start.auth_url)
+        if not code:
+            raise RuntimeError("oauth authorization code not captured")
+        self._log("OAuth authorization code captured, synthesizing callback URL")
+        callback_url = self._build_callback_url_from_code(code)
         if "state=" not in callback_url:
             sep = "&" if "?" in callback_url else "?"
             callback_url = f"{callback_url}{sep}state={self.oauth_start.state}"
@@ -1010,7 +1243,9 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
                 current_path, _ = self._browser_path()
                 if "log-in/password" in current_path:
                     raise EmailAlreadyUsedError(self.email or "")
-                result.error_message = f"注册失败: {_payload_error_code(register_data) or register_data}"
+                error_summary = _payload_error_summary(register_data)
+                self._log(f"提交注册失败详情: {error_summary}", "error")
+                result.error_message = f"注册失败: {error_summary}"
                 return result
 
             self._emit_status("otp_send", "发送邮箱验证码", step_index=7)

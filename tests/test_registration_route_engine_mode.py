@@ -96,3 +96,9 @@ async def test_start_outlook_batch_registration_threads_engine_mode():
     task = background_tasks.tasks[0]
     assert task.func is registration_routes.run_outlook_batch_registration
     assert task.args[8] == "legacy"
+
+
+def test_registration_request_models_default_to_v3():
+    assert registration_routes.RegistrationTaskCreate().engine_mode == "playwright_v3"
+    assert registration_routes.BatchRegistrationRequest().engine_mode == "playwright_v3"
+    assert registration_routes.OutlookBatchRegistrationRequest(service_ids=[1]).engine_mode == "playwright_v3"
