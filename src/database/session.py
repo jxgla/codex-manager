@@ -3,6 +3,7 @@
 """
 
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Generator
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
@@ -16,11 +17,40 @@ logger = logging.getLogger(__name__)
 
 
 def _build_sqlalchemy_url(database_url: str) -> str:
+    database_url = database_url.strip()
+
     if database_url.startswith("postgresql://"):
         return "postgresql+psycopg://" + database_url[len("postgresql://"):]
     if database_url.startswith("postgres://"):
         return "postgresql+psycopg://" + database_url[len("postgres://"):]
+
+    if database_url == ":memory:":
+        return "sqlite:///:memory:"
+
+    if database_url.startswith("sqlite:///"):
+        sqlite_path = database_url[len("sqlite:///"):]
+        if sqlite_path == ":memory:" or sqlite_path.startswith("file:"):
+            return database_url
+        return f"sqlite:///{_resolve_local_sqlite_path(sqlite_path).as_posix()}"
+
+    if "://" not in database_url:
+        return f"sqlite:///{_resolve_local_sqlite_path(database_url).as_posix()}"
+
     return database_url
+
+
+def _resolve_local_sqlite_path(database_path: str) -> Path:
+    path = Path(os.path.expanduser(database_path))
+    if path.is_absolute():
+        return path.resolve()
+
+    app_data_dir = os.environ.get("APP_DATA_DIR")
+    if app_data_dir:
+        base_dir = Path(app_data_dir).resolve().parent
+    else:
+        base_dir = Path(__file__).resolve().parents[2]
+
+    return (base_dir / path).resolve()
 
 
 class DatabaseSessionManager:

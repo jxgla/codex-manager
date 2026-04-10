@@ -100,9 +100,11 @@ cp .env.example .env
 | `APP_HOST` | 监听主机 | `0.0.0.0` |
 | `APP_PORT` | 监听端口 | `15555` |
 | `APP_ACCESS_PASSWORD` | Web UI 访问密钥 | `admin123` |
-| `APP_DATABASE_URL` | 数据库连接字符串 | `data/database.db` |
+| `APP_DATABASE_URL` | 数据库连接字符串 | `sqlite:///data/database.db` |
 
 > 优先级：命令行参数 > 环境变量（`.env`）> 数据库设置 > 默认值
+>
+> 本地 SQLite 推荐写成 `sqlite:///data/database.db`。当前版本也兼容 `data/database.db` 这类旧写法，但显式 URL 更不容易和其他驱动格式混淆。
 
 ### 修改端口
 
