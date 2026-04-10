@@ -1360,6 +1360,94 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
                     continue
         return None
 
+    def _oauth_auth_cookie_names(self) -> list[str]:
+        names: list[str] = []
+        seen = set()
+        if self._context is not None:
+            try:
+                for item in self._context.cookies():
+                    name = str((item or {}).get("name") or "").strip()
+                    domain = str((item or {}).get("domain") or "").strip().lower()
+                    if (
+                        name
+                        and name not in seen
+                        and (
+                            "auth.openai.com" in domain
+                            or domain.endswith(".openai.com")
+                            or domain == "openai.com"
+                        )
+                    ):
+                        seen.add(name)
+                        names.append(name)
+            except Exception:
+                pass
+        if self.session is not None:
+            for name, _value in _cookie_items(getattr(self.session, "cookies", None) or {}):
+                key = str(name or "").strip()
+                if key and key not in seen:
+                    seen.add(key)
+                    names.append(key)
+        return names
+
+    def _oauth_bootstrap_authorize_session(self) -> Tuple[bool, str]:
+        if not self.oauth_start:
+            return False, ""
+
+        auth_url = str(self.oauth_start.auth_url or "").strip()
+        parsed = urlparse(auth_url)
+        auth_params = {
+            key: values[-1]
+            for key, values in parse_qs(parsed.query, keep_blank_values=True).items()
+            if values
+        }
+
+        def has_login_cookie() -> bool:
+            cookies = self._oauth_auth_cookie_names()
+            return ("login_session" in cookies) or any(
+                str(name).startswith("oai-client-auth-session") for name in cookies
+            )
+
+        status, data, response = self._api(
+            "GET",
+            auth_url,
+            "OAuth authorize page",
+            expected=(200, 301, 302, 303, 307, 308),
+            headers={
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "referer": f"{self.chat_base}/",
+                "upgrade-insecure-requests": "1",
+            },
+            allow_redirects=True,
+        )
+        final_url = self._abs_auth_url(
+            str(getattr(response, "url", "") or self._extract_next_url(data, auth_url) or auth_url)
+        )
+        has_login = has_login_cookie()
+        self._log(f"OAuth bootstrap final={(final_url or '-')[:180]} login_session={'yes' if has_login else 'no'}")
+
+        if has_login or not auth_params:
+            return has_login, final_url
+
+        status2, data2, response2 = self._api(
+            "GET",
+            f"{self.auth_base}/api/oauth/oauth2/auth",
+            "OAuth oauth2/auth",
+            expected=(200, 301, 302, 303, 307, 308),
+            params=auth_params,
+            headers={
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "referer": auth_url,
+                "upgrade-insecure-requests": "1",
+            },
+            allow_redirects=True,
+        )
+        final2 = self._abs_auth_url(
+            str(getattr(response2, "url", "") or self._extract_next_url(data2, final_url) or final_url)
+        )
+        has_login = has_login_cookie()
+        self._log(f"OAuth bootstrap retry final={(final2 or '-')[:180]} login_session={'yes' if has_login else 'no'}")
+        return has_login, final2
+
     def _oauth_follow_chain_for_callback(
         self,
         start_url: str,
@@ -1563,6 +1651,7 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
             consent_url,
             getattr(self._page, "url", ""),
             self._last_browser_url,
+            self.last_otp_url,
             f"{self.auth_base}/sign-in-with-chatgpt/codex/consent",
         ):
             candidate = self._abs_auth_url(raw)
@@ -1683,6 +1772,27 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
             expected=(200, 201, 400, 401, 409),
             headers=headers,
             json_body={"username": {"kind": "email", "value": str(email or "").strip()}},
+            allow_redirects=False,
+        )
+        next_url = self._abs_auth_url(self._extract_next_url(data, ""))
+        page_type = self._extract_page_type(data)
+        return int(status or 0), data, next_url, page_type
+
+    def _oauth_password_verify(
+        self,
+        password: str,
+        referer_url: str = "",
+    ) -> Tuple[int, Any, str, str]:
+        headers = self._auth_headers()
+        headers["referer"] = self._abs_auth_url(referer_url) or f"{self.auth_base}/log-in/password"
+        headers["openai-sentinel-token"] = self._build_sentinel_token("password_verify")
+        status, data, _ = self._api(
+            "POST",
+            f"{self.auth_base}/api/accounts/password/verify",
+            "OAuth password/verify",
+            expected=(200, 201, 400, 401, 409),
+            headers=headers,
+            json_body={"password": str(password or "").strip()},
             allow_redirects=False,
         )
         next_url = self._abs_auth_url(self._extract_next_url(data, ""))
@@ -1910,74 +2020,81 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
         self.oauth_fail_reason = ""
         self._oauth_passwordless_active = False
         self._open_fresh_browser_page(self.oauth_start.auth_url)
-        current_url = self._browser_goto(
-            self.oauth_start.auth_url,
-            referer=f"{self.chat_base}/",
-            wait_ms=1800,
-        )
-        current_url, page_state = self._detect_browser_auth_state()
+        has_login, current_url = self._oauth_bootstrap_authorize_session()
         current_url = self._abs_auth_url(current_url or self.oauth_start.auth_url)
-        self._log(f"OAuth browser bootstrap state={page_state or '-'} url={current_url[:180]}")
+        page_state = ""
+        self._log(f"OAuth V3 bootstrap state={page_state or '-'} url={current_url[:180]}")
 
-        if self._looks_like_add_phone(page_state, current_url):
-            self._report_add_phone("oauth_bootstrap", page_state, current_url)
+        if self._looks_like_add_phone("", current_url):
+            self._report_add_phone("oauth_bootstrap", "", current_url)
             return None
-        if self._looks_like_challenge(page_state, current_url):
+        if self._looks_like_challenge("", current_url):
             self.oauth_fail_reason = "cloudflare challenge loop at oauth bootstrap"
             return None
 
-        browser_url, browser_state = self._oauth_browser_authenticate(
+        status, data, next_url, next_state = self._oauth_authorize_continue(
             self.email or "",
-            self.password or "",
-            start_url=current_url or self.oauth_start.auth_url,
+            current_url if str(current_url).startswith(self.auth_base) else f"{self.auth_base}/log-in",
         )
-        current_url = self._abs_auth_url(browser_url or current_url or self.oauth_start.auth_url)
-        page_state = str(browser_state or page_state or "").strip()
-        self._log(f"OAuth browser auth state={page_state or '-'} url={current_url[:180]}")
-
-        if self._looks_like_add_phone(page_state, current_url):
-            self._report_add_phone("oauth_browser_auth", page_state, current_url)
-            return None
-        if self._looks_like_challenge(page_state, current_url):
-            self.oauth_fail_reason = "cloudflare challenge loop at oauth login"
-            return None
-        if page_state in ("login_email", "login_password", "login_email_password"):
-            self.oauth_fail_reason = "browser oauth login did not advance"
-            return None
-
-        if (
-            not self._looks_like_otp_step(page_state, current_url)
-            and not self._looks_like_consent_step(page_state, current_url)
-            and not self._looks_like_callback(page_state, current_url)
-            and not self._looks_like_about_you(page_state, current_url)
-        ):
-            status, data, next_url, next_state = self._oauth_send_passwordless_otp(
-                referer=current_url or f"{self.auth_base}/log-in/password",
+        if int(status or 0) == 400 and "invalid_auth_step" in json.dumps(data, ensure_ascii=False).lower():
+            self._log("OAuth V3 invalid_auth_step, retry bootstrap once", "warning")
+            has_login, current_url = self._oauth_bootstrap_authorize_session()
+            current_url = self._abs_auth_url(current_url or self.oauth_start.auth_url)
+            status, data, next_url, next_state = self._oauth_authorize_continue(
+                self.email or "",
+                current_url if str(current_url).startswith(self.auth_base) else f"{self.auth_base}/log-in",
             )
-            if int(status or 0) in (200, 201):
-                self._oauth_passwordless_active = True
-                current_url = self._abs_auth_url(next_url or current_url)
-                page_state = str(next_state or page_state or "").strip()
-                if current_url:
-                    try:
-                        current_url = self._browser_goto(
-                            current_url,
-                            referer=browser_url or f"{self.auth_base}/log-in/password",
-                            wait_ms=1500,
-                        )
-                    except Exception:
-                        pass
-                    current_url, browser_state = self._detect_browser_auth_state()
-                    current_url = self._abs_auth_url(current_url or next_url or browser_url)
-                    page_state = str(browser_state or page_state or "").strip()
-                self._log(f"OAuth passwordless state={page_state or '-'} url={(current_url or '-')[:180]}")
-                if self._looks_like_add_phone(page_state, current_url):
-                    self._report_add_phone("oauth_passwordless", page_state, current_url, data)
-                    return None
+        if int(status or 0) not in (200, 201):
+            self.oauth_fail_reason = f"oauth authorize_continue failed: {_payload_error_summary(data)}"
+            self._log(f"OAuth V3 authorize/continue failed: {_payload_error_summary(data)}", "warning")
+            return None
 
-        if self._looks_like_otp_step(page_state, current_url):
+        current_url = self._abs_auth_url(next_url or current_url)
+        page_state = str(next_state or "").strip()
+        self._log(f"OAuth V3 post-email state={page_state or '-'} url={(current_url or '-')[:180]}")
+        if self._looks_like_add_phone(page_state, current_url):
+            self._report_add_phone("oauth_authorize_continue", page_state, current_url, data)
+            return None
+
+        status, data, next_url, next_state = self._oauth_password_verify(
+            self.password or "",
+            referer_url=f"{self.auth_base}/log-in/password",
+        )
+        if int(status or 0) not in (200, 201):
+            self.oauth_fail_reason = f"oauth password_verify failed: {_payload_error_summary(data)}"
+            self._log(f"OAuth V3 password/verify failed: {_payload_error_summary(data)}", "warning")
+            return None
+
+        current_url = self._abs_auth_url(next_url or current_url)
+        page_state = str(next_state or page_state or "").strip()
+        self._log(f"OAuth V3 post-password state={page_state or '-'} url={(current_url or '-')[:180]}")
+        if self._looks_like_add_phone(page_state, current_url):
+            self._report_add_phone("oauth_password_verify", page_state, current_url, data)
+            return None
+
+        if current_url:
+            current_url, browser_state = self._oauth_sync_step_from_browser(
+                current_url,
+                referer=f"{self.auth_base}/log-in/password",
+            )
+            current_url = self._abs_auth_url(current_url or next_url or self.oauth_start.auth_url)
+            page_state = str(browser_state or page_state or "").strip()
+            self._log(f"OAuth V3 browser sync state={page_state or '-'} url={(current_url or '-')[:180]}")
+            if self._looks_like_add_phone(page_state, current_url):
+                self._report_add_phone("oauth_browser_sync", page_state, current_url)
+                return None
+            if self._looks_like_challenge(page_state, current_url):
+                self.oauth_fail_reason = "cloudflare challenge loop after oauth password verify"
+                return None
+
+        need_otp = self._looks_like_otp_step(page_state, current_url)
+        if not need_otp:
+            need_otp = self._looks_like_otp_step(next_state, next_url)
+
+        if need_otp:
             self._otp_sent_at = time.time()
             self._oauth_passwordless_active = True
+            self.last_otp_url = self._abs_auth_url(current_url or next_url or f"{self.auth_base}/email-verification")
             self._log("[OTP][oauth] waiting for OAuth verification code")
             code, otp_phase = self._await_verification_code_with_resends(
                 self._oauth_resend_verification_code,
@@ -1994,25 +2111,24 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
             status, data = self._oauth_validate_secondary_otp(code)
             if int(status or 0) not in (200, 201):
                 self.oauth_fail_reason = f"oauth otp validate failed: {_payload_error_summary(data)}"
-                self._log(f"OAuth OTP validate failed: {_payload_error_summary(data)}", "warning")
+                self._log(f"OAuth V3 OTP validate failed: {_payload_error_summary(data)}", "warning")
                 return None
             next_url = self._extract_next_url(data, current_url)
             next_state = self._extract_page_type(data) or page_state
             if self._looks_like_add_phone(next_state, next_url):
                 self._report_add_phone("oauth_post_otp", next_state, next_url, data)
                 return None
-            if next_url:
-                current_url = self._browser_goto(
-                    self._abs_auth_url(next_url),
-                    referer=current_url or f"{self.auth_base}/log-in/password",
-                    wait_ms=1600,
+            current_url = self._abs_auth_url(next_url or current_url)
+            if current_url:
+                current_url, browser_state = self._oauth_sync_step_from_browser(
+                    current_url,
+                    referer=current_url or f"{self.auth_base}/email-verification",
                 )
-                current_url, browser_state = self._detect_browser_auth_state()
                 current_url = self._abs_auth_url(current_url or next_url)
                 page_state = str(browser_state or next_state or "").strip()
             else:
                 page_state = str(next_state or page_state or "").strip()
-            self._log(f"OAuth post-otp state={page_state or '-'} url={(current_url or '-')[:180]}")
+            self._log(f"OAuth V3 post-otp state={page_state or '-'} url={(current_url or '-')[:180]}")
 
         if self._looks_like_about_you(page_state, current_url):
             self._log("OAuth landed on about-you, replaying profile create once", "warning")
@@ -2033,15 +2149,24 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
 
         code = _extract_code_from_url(current_url)
         if not code and current_url:
-            code = self._oauth_follow_chain_for_code(current_url, referer=current_url)[0]
+            code = self._oauth_follow_chain_for_code(
+                current_url,
+                referer=f"{self.auth_base}/log-in/password",
+            )[0]
         if not code and self._looks_like_consent_step(page_state, current_url):
-            code = self._oauth_resolve_code(current_url, referer=current_url or self.oauth_start.auth_url)
+            code = self._oauth_resolve_code(
+                current_url,
+                referer=f"{self.auth_base}/log-in/password",
+            )
         if not code:
-            code = self._oauth_resolve_code("", referer=current_url or self.oauth_start.auth_url)
+            code = self._oauth_resolve_code(
+                "",
+                referer=f"{self.auth_base}/log-in/password",
+            )
         if not code:
             self.oauth_fail_reason = self.oauth_fail_reason or "no authorization code after consent"
             return None
-        self._log("OAuth browser flow captured authorization code")
+        self._log("OAuth V3 API-first flow captured authorization code")
         return self._build_callback_url_from_code(code)
 
     def _build_callback_url_from_code(self, code: str) -> str:
@@ -2136,8 +2261,7 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
             callback_url = self._perform_oauth_browser_flow()
             if callback_url:
                 return callback_url
-            if self.oauth_fail_reason:
-                self._log(f"OAuth browser flow fallback reason: {self.oauth_fail_reason}", "warning")
+            raise RuntimeError(self.oauth_fail_reason or "oauth authorization code not captured")
         elif mode == "playwright_v2":
             callback_url = self._perform_oauth_passwordless_flow()
             if callback_url:

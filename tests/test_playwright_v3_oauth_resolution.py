@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from src.core.register_playwright import (
     PlaywrightRegistrationEngine,
     _PlaywrightResponseShim,
@@ -26,6 +28,7 @@ def test_perform_oauth_builds_callback_from_authorization_code(monkeypatch):
         state="state-123",
         redirect_uri="http://localhost:1455/callback",
     )
+    engine._resolved_execution_mode = lambda: "legacy"
 
     def fake_api(method, url, step, **kwargs):
         return (
@@ -47,6 +50,138 @@ def test_perform_oauth_builds_callback_from_authorization_code(monkeypatch):
     callback_url = engine.perform_oauth()
 
     assert callback_url == "http://localhost:1455/callback?code=oauth-code-xyz&state=state-123"
+
+
+def test_oauth_bootstrap_authorize_session_retries_oauth2_auth(monkeypatch):
+    engine = PlaywrightRegistrationEngine(
+        email_service=_dummy_email_service(),
+        callback_logger=lambda *_args, **_kwargs: None,
+    )
+    engine.oauth_start = SimpleNamespace(
+        auth_url=(
+            "https://auth.openai.com/oauth/authorize?"
+            "client_id=test-client&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fcallback&state=state-123"
+        ),
+        state="state-123",
+        redirect_uri="http://localhost:1455/callback",
+    )
+
+    calls = []
+    responses = [
+        (
+            200,
+            {},
+            _PlaywrightResponseShim(status_code=200, url="https://auth.openai.com/log-in"),
+        ),
+        (
+            200,
+            {},
+            _PlaywrightResponseShim(status_code=200, url="https://auth.openai.com/log-in/password"),
+        ),
+    ]
+    cookie_snapshots = [[], ["login_session"]]
+
+    def fake_api(method, url, step, **kwargs):
+        calls.append((url, kwargs.get("params")))
+        return responses.pop(0)
+
+    monkeypatch.setattr(engine, "_api", fake_api)
+    monkeypatch.setattr(
+        engine,
+        "_oauth_auth_cookie_names",
+        lambda: cookie_snapshots.pop(0) if cookie_snapshots else ["login_session"],
+    )
+
+    has_login, final_url = engine._oauth_bootstrap_authorize_session()
+
+    assert has_login is True
+    assert final_url == "https://auth.openai.com/log-in/password"
+    assert calls[1][0] == "https://auth.openai.com/api/oauth/oauth2/auth"
+    assert calls[1][1]["client_id"] == "test-client"
+
+
+def test_perform_oauth_v3_uses_api_first_sequence(monkeypatch):
+    engine = PlaywrightRegistrationEngine(
+        email_service=_dummy_email_service(),
+        callback_logger=lambda *_args, **_kwargs: None,
+    )
+    engine.email = "v3@example.com"
+    engine.password = "pw-123"
+    engine.oauth_start = SimpleNamespace(
+        auth_url="https://auth.openai.com/oauth/authorize?client_id=test",
+        state="state-123",
+        redirect_uri="http://localhost:1455/callback",
+    )
+
+    sync_steps = [
+        ("https://auth.openai.com/email-verification", "email_otp_verification"),
+        ("https://auth.openai.com/sign-in-with-chatgpt/codex/consent", "consent"),
+    ]
+    password_verify_calls = []
+
+    monkeypatch.setattr(engine, "_open_fresh_browser_page", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(engine, "_oauth_bootstrap_authorize_session", lambda: (True, "https://auth.openai.com/log-in"))
+    monkeypatch.setattr(
+        engine,
+        "_oauth_authorize_continue",
+        lambda *_args, **_kwargs: (
+            200,
+            {"continue_url": "/log-in/password", "page": {"type": "login_password"}},
+            "https://auth.openai.com/log-in/password",
+            "login_password",
+        ),
+    )
+
+    def fake_password_verify(password, referer_url=""):
+        password_verify_calls.append((password, referer_url))
+        return (
+            200,
+            {"continue_url": "/email-verification", "page": {"type": "email_otp_verification"}},
+            "https://auth.openai.com/email-verification",
+            "email_otp_verification",
+        )
+
+    monkeypatch.setattr(engine, "_oauth_password_verify", fake_password_verify)
+    monkeypatch.setattr(engine, "_oauth_sync_step_from_browser", lambda *_args, **_kwargs: sync_steps.pop(0))
+    monkeypatch.setattr(engine, "_await_verification_code_with_resends", lambda *_args, **_kwargs: ("123456", None))
+    monkeypatch.setattr(
+        engine,
+        "_oauth_validate_secondary_otp",
+        lambda _code: (
+            200,
+            {"continue_url": "/sign-in-with-chatgpt/codex/consent", "page": {"type": "consent"}},
+        ),
+    )
+    monkeypatch.setattr(engine, "_oauth_resolve_code", lambda *_args, **_kwargs: "oauth-code-v3")
+    monkeypatch.setattr(engine, "_oauth_follow_chain_for_code", lambda *_args, **_kwargs: (None, ""))
+    monkeypatch.setattr(
+        engine,
+        "_oauth_browser_authenticate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy browser login path should not run for V3")),
+    )
+
+    callback_url = engine._perform_oauth_browser_flow()
+
+    assert callback_url == "http://localhost:1455/callback?code=oauth-code-v3&state=state-123"
+    assert password_verify_calls == [("pw-123", "https://auth.openai.com/log-in/password")]
+
+
+def test_perform_oauth_v3_raises_flow_reason(monkeypatch):
+    engine = PlaywrightRegistrationEngine(
+        email_service=_dummy_email_service(),
+        callback_logger=lambda *_args, **_kwargs: None,
+    )
+    engine.oauth_start = SimpleNamespace(
+        auth_url="https://auth.openai.com/oauth/authorize?client_id=test",
+        state="state-123",
+        redirect_uri="http://localhost:1455/callback",
+    )
+    engine._resolved_execution_mode = lambda: "playwright_v3"
+    engine.oauth_fail_reason = "add-phone gate"
+    monkeypatch.setattr(engine, "_perform_oauth_browser_flow", lambda: None)
+
+    with pytest.raises(RuntimeError, match="add-phone gate"):
+        engine.perform_oauth()
 
 
 def test_perform_oauth_v2_uses_passwordless_flow():

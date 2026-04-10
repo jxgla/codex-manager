@@ -3,7 +3,7 @@ Playwright V3 registration engine.
 
 V3 follows the two-stage daily-bing style flow:
 1. finish account creation first
-2. bootstrap and extract OAuth afterwards
+2. run the daily-playwright style OAuth flow afterwards
 """
 
 from __future__ import annotations
