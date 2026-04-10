@@ -52,6 +52,30 @@ def test_perform_oauth_builds_callback_from_authorization_code(monkeypatch):
     assert callback_url == "http://localhost:1455/callback?code=oauth-code-xyz&state=state-123"
 
 
+def test_build_sentinel_token_prefers_sdk_over_local_pow(monkeypatch):
+    engine = PlaywrightRegistrationEngine(
+        email_service=_dummy_email_service(),
+        callback_logger=lambda *_args, **_kwargs: None,
+    )
+    pow_calls = []
+
+    monkeypatch.setattr(
+        engine,
+        "_resolve_sentinel_token",
+        lambda flow, fallback_flow="": f"sdk::{flow}::{fallback_flow}",
+    )
+    monkeypatch.setattr(
+        engine,
+        "_build_sentinel_pow_token",
+        lambda label: pow_calls.append(label) or "pow-token",
+    )
+
+    token = engine._build_sentinel_token("authorize_continue")
+
+    assert token == "sdk::authorize_continue::"
+    assert pow_calls == []
+
+
 def test_oauth_bootstrap_authorize_session_retries_oauth2_auth(monkeypatch):
     engine = PlaywrightRegistrationEngine(
         email_service=_dummy_email_service(),
@@ -98,6 +122,120 @@ def test_oauth_bootstrap_authorize_session_retries_oauth2_auth(monkeypatch):
     assert final_url == "https://auth.openai.com/log-in/password"
     assert calls[1][0] == "https://auth.openai.com/api/oauth/oauth2/auth"
     assert calls[1][1]["client_id"] == "test-client"
+
+
+def test_oauth_authorize_continue_uses_sdk_sentinel_token(monkeypatch):
+    engine = PlaywrightRegistrationEngine(
+        email_service=_dummy_email_service(),
+        callback_logger=lambda *_args, **_kwargs: None,
+    )
+    resolved = []
+    pow_calls = []
+    captured = {}
+
+    monkeypatch.setattr(
+        engine,
+        "_resolve_sentinel_token",
+        lambda flow, fallback_flow="": resolved.append((flow, fallback_flow)) or "sdk-authorize-token",
+    )
+    monkeypatch.setattr(
+        engine,
+        "_build_sentinel_pow_token",
+        lambda label: pow_calls.append(label) or "pow-token",
+    )
+
+    def fake_api(method, url, step, **kwargs):
+        captured.update(kwargs)
+        return 200, {"continue_url": "/log-in/password", "page": {"type": "login_password"}}, _PlaywrightResponseShim(status_code=200)
+
+    monkeypatch.setattr(engine, "_api", fake_api)
+
+    status, data, next_url, page_type = engine._oauth_authorize_continue(
+        "sdk@example.com",
+        "https://auth.openai.com/log-in",
+    )
+
+    assert status == 200
+    assert data["continue_url"] == "/log-in/password"
+    assert next_url == "https://auth.openai.com/log-in/password"
+    assert page_type == "login_password"
+    assert captured["headers"]["openai-sentinel-token"] == "sdk-authorize-token"
+    assert captured["headers"]["oai-device-id"] == engine.device_id
+    assert resolved == [("authorize_continue", "")]
+    assert pow_calls == []
+
+
+def test_oauth_password_verify_uses_sdk_sentinel_token(monkeypatch):
+    engine = PlaywrightRegistrationEngine(
+        email_service=_dummy_email_service(),
+        callback_logger=lambda *_args, **_kwargs: None,
+    )
+    resolved = []
+    pow_calls = []
+    captured = {}
+
+    monkeypatch.setattr(
+        engine,
+        "_resolve_sentinel_token",
+        lambda flow, fallback_flow="": resolved.append((flow, fallback_flow)) or "sdk-password-token",
+    )
+    monkeypatch.setattr(
+        engine,
+        "_build_sentinel_pow_token",
+        lambda label: pow_calls.append(label) or "pow-token",
+    )
+
+    def fake_api(method, url, step, **kwargs):
+        captured.update(kwargs)
+        return 200, {"continue_url": "/email-verification", "page": {"type": "email_otp_verification"}}, _PlaywrightResponseShim(status_code=200)
+
+    monkeypatch.setattr(engine, "_api", fake_api)
+
+    status, data, next_url, page_type = engine._oauth_password_verify(
+        "pw-123",
+        "https://auth.openai.com/log-in/password",
+    )
+
+    assert status == 200
+    assert data["continue_url"] == "/email-verification"
+    assert next_url == "https://auth.openai.com/email-verification"
+    assert page_type == "email_otp_verification"
+    assert captured["headers"]["openai-sentinel-token"] == "sdk-password-token"
+    assert captured["headers"]["oai-device-id"] == engine.device_id
+    assert resolved == [("password_verify", "")]
+    assert pow_calls == []
+
+
+def test_create_account_uses_sdk_token_and_session_observer(monkeypatch):
+    engine = PlaywrightRegistrationEngine(
+        email_service=_dummy_email_service(),
+        callback_logger=lambda *_args, **_kwargs: None,
+    )
+    token_calls = []
+    captured = {}
+
+    monkeypatch.setattr(engine, "_browser_path", lambda: ("", "https://auth.openai.com/about-you"))
+    monkeypatch.setattr(
+        engine,
+        "_resolve_sentinel_token",
+        lambda flow, fallback_flow="": token_calls.append((flow, fallback_flow)) or "sdk-create-account-token",
+    )
+    monkeypatch.setattr(engine, "_resolve_sentinel_so_token", lambda flow: "sdk-session-observer-token")
+
+    def fake_api(method, url, step, **kwargs):
+        captured.update(kwargs)
+        return 200, {"continue_url": "https://chatgpt.com/"}, _PlaywrightResponseShim(status_code=200)
+
+    monkeypatch.setattr(engine, "_api", fake_api)
+
+    status, data = engine.create_account("sdk@example.com")
+
+    assert status == 200
+    assert data["continue_url"] == "https://chatgpt.com/"
+    assert captured["headers"]["openai-sentinel-token"] == "sdk-create-account-token"
+    assert captured["headers"]["openai-sentinel-so-token"] == "sdk-session-observer-token"
+    assert captured["headers"]["oai-device-id"] == engine.device_id
+    assert token_calls == [("oauth_create_account", "create_account")]
 
 
 def test_perform_oauth_v3_uses_api_first_sequence(monkeypatch):

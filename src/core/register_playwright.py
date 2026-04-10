@@ -30,6 +30,7 @@ CHATGPT_AUTH_SESSION_URL = "https://chatgpt.com/api/auth/session"
 SENTINEL_REQ_PATH = "/backend-api/sentinel/req"
 SENTINEL_FRAME_PATH = "/backend-api/sentinel/frame.html"
 SENTINEL_SDK_PATH = "/sentinel/20260124ceb8/sdk.js"
+SENTINEL_FRAME_VERSION = "20260219f9f6"
 ERROR_EMAIL_ALREADY_USED = "EMAIL_ALREADY_USED"
 
 _BROWSER_PROFILES = (
@@ -137,6 +138,44 @@ def _payload_error_summary(data: Any) -> str:
                 return value
         return json.dumps(data, ensure_ascii=False)[:500]
     return str(data or "").strip()[:500]
+
+
+def _extract_direct_token(raw: Any) -> Optional[str]:
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    if isinstance(raw, dict):
+        for key in ("token", "sentinel", "sentinel_token", "sentinelToken", "value", "result"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _extract_triplet(raw: Any) -> Optional[Dict[str, str]]:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return None
+    if not isinstance(raw, dict):
+        return None
+    proof = str(raw.get("p") or raw.get("pow") or raw.get("proof") or "").strip()
+    turnstile = str(raw.get("t") or raw.get("turnstile") or raw.get("turnstile_token") or "").strip()
+    challenge = str(raw.get("c") or raw.get("challenge") or raw.get("challenge_token") or raw.get("token") or "").strip()
+    return {"p": proof, "t": turnstile, "c": challenge} if proof and challenge else None
+
+
+def _trace_headers() -> Dict[str, str]:
+    trace_id = random.randint(10**17, 10**18 - 1)
+    parent_id = random.randint(10**17, 10**18 - 1)
+    return {
+        "traceparent": f"00-{uuid.uuid4().hex}-{format(parent_id, '016x')}-01",
+        "tracestate": "dd=s:1;o:rum",
+        "x-datadog-origin": "rum",
+        "x-datadog-sampling-priority": "1",
+        "x-datadog-trace-id": str(trace_id),
+        "x-datadog-parent-id": str(parent_id),
+    }
 
 
 def _random_browser_profile(rng: random.Random) -> Dict[str, Any]:
@@ -278,12 +317,16 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
         self._browser = None
         self._context = None
         self._page = None
+        self._sentinel_page = None
         self._pw_timeout_ms = 45000
         self._cf_primed_hosts: set[str] = set()
         self._last_browser_url = ""
         self.last_session: Dict[str, Any] = {}
         self.oauth_fail_reason = ""
         self._oauth_passwordless_active = False
+        self._sentinel_bundle_loaded = False
+        self._sentinel_flow_tokens: Dict[str, str] = {}
+        self._sentinel_flow_so_tokens: Dict[str, str] = {}
         user_info = generate_random_user_info()
         self.name = user_info.get("name") or "Neo"
         self.birthdate = user_info.get("birthdate") or "2000-02-20"
@@ -313,7 +356,7 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
             return False
 
     def close(self):
-        for attr in ("_page", "_context", "_browser"):
+        for attr in ("_sentinel_page", "_page", "_context", "_browser"):
             obj = getattr(self, attr, None)
             if not obj:
                 continue
@@ -353,6 +396,24 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
         self._context.set_default_timeout(self._pw_timeout_ms)
         self._page = self._context.new_page()
         self._sync_http_cookies_to_browser(CHATGPT_SIGNIN_URL)
+        self._initialize_sentinel_page()
+
+    def _initialize_sentinel_page(self):
+        if self._context is None or self._sentinel_page is not None:
+            return
+        try:
+            self._sentinel_page = self._context.new_page()
+            frame_url = f"{self.sentinel_base}{SENTINEL_FRAME_PATH}?sv={SENTINEL_FRAME_VERSION}"
+            self._sentinel_page.goto(
+                frame_url,
+                wait_until="domcontentloaded",
+                timeout=self._pw_timeout_ms,
+            )
+            self._sentinel_page.wait_for_timeout(3000)
+            self._sentinel_bundle_loaded = False
+            self._log(f"Sentinel frame ready: {frame_url}")
+        except Exception as exc:
+            self._log(f"Sentinel frame init failed: {exc}", "warning")
 
     def _sync_http_cookies_to_browser(self, seed_url: str):
         if self._context is None or self.session is None:
@@ -1101,7 +1162,159 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
             self._log(f"{step} 失败: HTTP {status} {compact[:500]}", "warning")
         return status, data, response
 
-    def _build_sentinel_token(self, label: str) -> str:
+    def _ensure_sentinel_bundle(self) -> bool:
+        self._ensure_playwright_runtime()
+        if self._sentinel_page is None:
+            self._initialize_sentinel_page()
+        if self._sentinel_page is None:
+            return False
+        if self._sentinel_bundle_loaded:
+            return True
+        try:
+            result = self._sentinel_page.evaluate(
+                """async (flows) => {
+                    const out = {};
+                    const sdk = window.SentinelSDK || window.sentinelSDK || window.__SentinelSDK || (window.openai && window.openai.SentinelSDK);
+                    if (!sdk) return out;
+                    for (const flow of flows) {
+                        let tokenRaw = null;
+                        let soRaw = null;
+                        let error = null;
+                        try {
+                            if (typeof sdk.init === "function") await sdk.init(flow);
+                            tokenRaw = await sdk.token(flow);
+                        } catch (e) {
+                            error = String((e && e.message) || e || "token failed");
+                        }
+                        try {
+                            if (typeof sdk.sessionObserverToken === "function") {
+                                soRaw = await sdk.sessionObserverToken(flow);
+                            }
+                        } catch (e) {
+                            if (!error) error = String((e && e.message) || e || "so failed");
+                        }
+                        out[flow] = { tokenRaw, soRaw, error };
+                    }
+                    return out;
+                }""",
+                [
+                    "authorize_continue",
+                    "username_password_create",
+                    "password_verify",
+                    "oauth_create_account",
+                    "email_otp_verification",
+                ],
+            )
+        except Exception as exc:
+            self._log(f"Sentinel SDK preload failed: {exc}", "warning")
+            return False
+
+        self._sentinel_bundle_loaded = True
+        if not isinstance(result, dict):
+            return True
+
+        for flow, data in result.items():
+            if not isinstance(data, dict):
+                continue
+            token = _extract_direct_token(data.get("tokenRaw"))
+            if not token:
+                triplet = _extract_triplet(data.get("tokenRaw"))
+                if triplet and triplet.get("p") and triplet.get("c"):
+                    triplet["id"] = self.device_id
+                    triplet["flow"] = str(flow)
+                    token = json.dumps(triplet, separators=(",", ":"))
+            so_token = _extract_direct_token(data.get("soRaw")) or ""
+            if token:
+                self._sentinel_flow_tokens[str(flow)] = token
+            if so_token:
+                self._sentinel_flow_so_tokens[str(flow)] = so_token
+        return True
+
+    def _resolve_sentinel_token(
+        self,
+        flow: str,
+        fallback_flow: str = "",
+    ) -> Optional[str]:
+        self._ensure_sentinel_bundle()
+        flow = str(flow or "").strip()
+        fallback_flow = str(fallback_flow or "").strip()
+        token = self._sentinel_flow_tokens.get(flow) or (
+            self._sentinel_flow_tokens.get(fallback_flow) if fallback_flow else None
+        )
+        if token:
+            return token
+        if self._sentinel_page is None:
+            return None
+        try:
+            result = self._sentinel_page.evaluate(
+                """async ({flow,deviceId}) => {
+                    const sdk = window.SentinelSDK || window.sentinelSDK || window.__SentinelSDK || (window.openai && window.openai.SentinelSDK);
+                    if (!sdk || typeof sdk.token !== 'function') return null;
+                    const lang = navigator.language || 'en-US';
+                    const caps = JSON.stringify({
+                        is_passkey_supported: false,
+                        is_platform_authenticator_available: false,
+                        is_conditional_mediation_available: false,
+                    });
+                    const tries = [
+                        () => sdk.token({flow, id: deviceId}),
+                        () => sdk.token({flow, id: deviceId, 'data-build': lang}),
+                        () => sdk.token({flow, id: deviceId, dataBuild: lang}),
+                        () => sdk.token({flow, id: deviceId, 'data-build': lang, 'ext-passkey-client-capabilities': caps}),
+                        () => sdk.token(flow),
+                        () => sdk.token({flow}),
+                        () => sdk.token(),
+                    ];
+                    for (const fn of tries) {
+                        try { return await fn(); } catch (e) {}
+                    }
+                    return null;
+                }""",
+                {"flow": flow, "deviceId": self.device_id},
+            )
+        except Exception as exc:
+            self._log(f"Sentinel SDK token({flow}) failed: {exc}", "warning")
+            return None
+
+        direct = _extract_direct_token(result)
+        if direct:
+            self._sentinel_flow_tokens[flow] = direct
+            return direct
+        triplet = _extract_triplet(result)
+        if triplet and triplet.get("p") and triplet.get("c"):
+            triplet["id"] = self.device_id
+            triplet["flow"] = flow
+            token = json.dumps(triplet, separators=(",", ":"))
+            self._sentinel_flow_tokens[flow] = token
+            return token
+        return None
+
+    def _resolve_sentinel_so_token(self, flow: str) -> str:
+        self._ensure_sentinel_bundle()
+        flow = str(flow or "").strip()
+        token = self._sentinel_flow_so_tokens.get(flow)
+        if token:
+            return token
+        if self._sentinel_page is None:
+            return ""
+        try:
+            token = self._sentinel_page.evaluate(
+                """async (flow) => {
+                    const sdk = window.SentinelSDK || window.sentinelSDK || window.__SentinelSDK || (window.openai && window.openai.SentinelSDK);
+                    if (!sdk || typeof sdk.sessionObserverToken !== 'function') return '';
+                    try { return await sdk.sessionObserverToken(flow); } catch(e) { return ''; }
+                }""",
+                flow,
+            ) or ""
+        except Exception as exc:
+            self._log(f"Sentinel sessionObserverToken({flow}) failed: {exc}", "warning")
+            return ""
+        token = str(token or "").strip()
+        if token:
+            self._sentinel_flow_so_tokens[flow] = token
+        return token
+
+    def _build_sentinel_pow_token(self, label: str) -> str:
         payload = {
             "pathname": label,
             "sdk_url": f"{self.sentinel_base}{SENTINEL_SDK_PATH}",
@@ -1123,6 +1336,17 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
         except Exception as exc:
             self._log(f"Sentinel 回退 requirements token: {exc}", "warning")
         return self.sentinel.generate_requirements_token()
+
+    def _build_sentinel_token(self, label: str, fallback_flow: str = "") -> str:
+        token = self._resolve_sentinel_token(label, fallback_flow=fallback_flow)
+        if token:
+            self._log(f"Sentinel SDK token ready: {label}")
+            return token
+        self._log(
+            f"Sentinel SDK token unavailable for {label}, falling back to local PoW token",
+            "warning",
+        )
+        return self._build_sentinel_pow_token(label)
 
     def _signin_query_params(self, email: str) -> Dict[str, Any]:
         return {
@@ -1188,13 +1412,9 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
         return "invalid_state" in body or "invalid session" in body
 
     def register(self, email: str) -> Tuple[int, Any]:
-        headers = {
-            "content-type": "application/json",
-            "accept": "application/json",
-            "origin": self.auth_base,
-            "referer": f"{self.auth_base}/create-account/password",
-            "openai-sentinel-token": self._build_sentinel_token("username_password_create"),
-        }
+        headers = self._auth_headers()
+        headers["referer"] = f"{self.auth_base}/create-account/password"
+        headers["openai-sentinel-token"] = self._build_sentinel_token("username_password_create")
         params = {
             "ext-passkey-client-capabilities": json.dumps(
                 {
@@ -1219,13 +1439,9 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
     def _send_verification_code(self, referer: Optional[str] = None) -> bool:
         self._otp_sent_at = time.time()
         _, current_url = self._browser_path()
-        headers = {
-            "content-type": "application/json",
-            "accept": "application/json",
-            "origin": self.auth_base,
-            "referer": str(referer or current_url or f"{self.auth_base}/create-account/password"),
-            "openai-sentinel-token": self._build_sentinel_token("email_otp_verification"),
-        }
+        headers = self._auth_headers()
+        headers["referer"] = str(referer or current_url or f"{self.auth_base}/create-account/password")
+        headers["openai-sentinel-token"] = self._build_sentinel_token("email_otp_verification")
         status, data, _ = self._api(
             "POST",
             f"{self.auth_base}/api/accounts/email-otp/send",
@@ -1241,13 +1457,9 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
 
     def validate_otp(self, otp: str) -> Tuple[int, Any]:
         _, current_url = self._browser_path()
-        headers = {
-            "content-type": "application/json",
-            "accept": "application/json",
-            "origin": self.auth_base,
-            "referer": str(current_url or f"{self.auth_base}/email-verification"),
-            "openai-sentinel-token": self._build_sentinel_token("email_otp_verification"),
-        }
+        headers = self._auth_headers()
+        headers["referer"] = str(current_url or f"{self.auth_base}/email-verification")
+        headers["openai-sentinel-token"] = self._build_sentinel_token("email_otp_verification")
         return self._api(
             "POST",
             f"{self.auth_base}/api/accounts/email-otp/validate",
@@ -1259,13 +1471,15 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
 
     def create_account(self, email: str) -> Tuple[int, Any]:
         _, current_url = self._browser_path()
-        headers = {
-            "content-type": "application/json",
-            "accept": "application/json",
-            "origin": self.auth_base,
-            "referer": str(current_url or f"{self.auth_base}/about-you"),
-            "openai-sentinel-token": self._build_sentinel_token("oauth_create_account"),
-        }
+        headers = self._auth_headers()
+        headers["referer"] = str(current_url or f"{self.auth_base}/about-you")
+        headers["openai-sentinel-token"] = self._build_sentinel_token(
+            "oauth_create_account",
+            fallback_flow="create_account",
+        )
+        sentinel_so_token = self._resolve_sentinel_so_token("oauth_create_account")
+        if sentinel_so_token:
+            headers["openai-sentinel-so-token"] = sentinel_so_token
         status, data, _ = self._api(
             "POST",
             f"{self.auth_base}/api/accounts/create_account",
@@ -1322,6 +1536,8 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
             "content-type": "application/json",
             "origin": self.auth_base,
             "referer": self.auth_base,
+            "oai-device-id": self.device_id,
+            **_trace_headers(),
         }
 
     def _abs_auth_url(self, url: str) -> str:
