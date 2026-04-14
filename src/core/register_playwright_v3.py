@@ -126,13 +126,28 @@ class PlaywrightRegistrationEngineV3(PlaywrightRegistrationEngine):
                 result.error_message = "Initialize OAuth failed"
                 return result
 
-            self._emit_status("oauth_callback", "Extract OAuth callback", step_index=12)
+            self._emit_status("oauth_callback", "Extract OAuth code and exchange token", step_index=12)
             callback_url = self.perform_oauth()
-            token_info = self._handle_oauth_callback(callback_url)
+            # Extract code from callback_url and exchange via Playwright session
+            # (mirrors daily-bing's _oauth_exchange_code for reliable token exchange)
+            from .register_playwright import _extract_code_from_url
+            auth_code = _extract_code_from_url(callback_url)
+            token_info = None
+            if auth_code:
+                token_info = self._oauth_exchange_code_via_playwright(auth_code)
+                if token_info:
+                    self._log("OAuth token acquired via Playwright exchange")
+            if not token_info:
+                # Fallback to original oauth_manager.handle_callback
+                self._log("Playwright exchange unavailable, falling back to oauth_manager", "warning")
+                token_info = self._handle_oauth_callback(callback_url)
             if not token_info:
                 result.error_message = "OAuth callback handling failed"
                 return result
 
+            if not result.workspace_id:
+                # Try from token exchange result first (Playwright exchange extracts from JWT)
+                result.workspace_id = str(token_info.get("workspace_id") or "").strip()
             if not result.workspace_id:
                 auth_session = self._decode_auth_session_cookie() or {}
                 workspaces = auth_session.get("workspaces") or []

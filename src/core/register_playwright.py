@@ -2398,6 +2398,130 @@ class PlaywrightRegistrationEngine(RegistrationEngine):
         sep = "&" if "?" in redirect_uri else "?"
         return f"{redirect_uri}{sep}{query}"
 
+    def _oauth_exchange_code_via_playwright(self, code: str) -> Optional[Dict[str, Any]]:
+        """Exchange authorization code for tokens using Playwright request context.
+
+        Mirrors daily-bing's _oauth_exchange_code: uses the browser session (with
+        all cookies) to POST to /oauth/token, then does workspace/select and
+        organization/select with the resulting access_token.
+        """
+        if not self.oauth_start or not str(code or "").strip():
+            return None
+
+        from ..config.constants import OAUTH_CLIENT_ID, OAUTH_REDIRECT_URI
+
+        redirect_uri = str(self.oauth_start.redirect_uri or OAUTH_REDIRECT_URI).strip()
+        client_id = OAUTH_CLIENT_ID
+        code_verifier = str(self.oauth_start.code_verifier or "").strip()
+        token_url = f"{self.auth_base}/oauth/token"
+
+        token_payload = {
+            "grant_type": "authorization_code",
+            "code": str(code).strip(),
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+            "code_verifier": code_verifier,
+        }
+
+        # Try form-encoded first (matches daily-bing _oauth_exchange_code)
+        status, data, _ = self._api(
+            "POST",
+            token_url,
+            "OAuth token(form)",
+            expected=(200, 201, 400),
+            headers={"content-type": "application/x-www-form-urlencoded"},
+            form=token_payload,
+            allow_redirects=False,
+        )
+        access_token = str((data if isinstance(data, dict) else {}).get("access_token") or "").strip()
+        if int(status or 0) in (200, 201) and access_token:
+            self._log("OAuth token exchange succeeded (form)")
+        else:
+            # Fallback: try JSON body
+            status, data, _ = self._api(
+                "POST",
+                token_url,
+                "OAuth token(json)",
+                expected=(200, 201, 400),
+                headers=self._auth_headers(),
+                json_body=token_payload,
+                allow_redirects=False,
+            )
+            access_token = str((data if isinstance(data, dict) else {}).get("access_token") or "").strip()
+            if int(status or 0) not in (200, 201) or not access_token:
+                self._log(f"OAuth token exchange failed: status={status}", "error")
+                return None
+            self._log("OAuth token exchange succeeded (json)")
+
+        # Post-exchange: workspace/select + organization/select (mirrors daily-bing)
+        tokens = data if isinstance(data, dict) else {}
+        id_token_raw = str(tokens.get("id_token") or "").strip()
+        if id_token_raw:
+            try:
+                from .openai.oauth import _jwt_claims_no_verify
+                claims = _jwt_claims_no_verify(id_token_raw)
+            except Exception:
+                claims = {}
+        else:
+            claims = {}
+
+        workspace_id = str(
+            tokens.get("workspace_id") or claims.get("workspace_id") or ""
+        ).strip()
+        organization = str(
+            tokens.get("organization")
+            or claims.get("organization")
+            or claims.get("org_id")
+            or ""
+        ).strip()
+
+        if workspace_id:
+            try:
+                self._api(
+                    "POST",
+                    f"{self.auth_base}/api/accounts/workspace/select",
+                    "OAuth post-exchange workspace/select",
+                    expected=(200, 201, 400),
+                    headers={"authorization": f"Bearer {access_token}", **self._auth_headers()},
+                    json_body={"workspace_id": workspace_id},
+                )
+            except Exception as exc:
+                self._log(f"Post-exchange workspace/select warning: {exc}", "warning")
+
+        if organization:
+            try:
+                self._api(
+                    "POST",
+                    f"{self.auth_base}/api/accounts/organization/select",
+                    "OAuth post-exchange organization/select",
+                    expected=(200, 201, 400),
+                    headers={"authorization": f"Bearer {access_token}", **self._auth_headers()},
+                    json_body={"organization": organization},
+                )
+            except Exception as exc:
+                self._log(f"Post-exchange organization/select warning: {exc}", "warning")
+
+        # Build token_info dict compatible with _handle_oauth_callback return
+        auth_claims = claims.get("https://api.openai.com/auth") or {}
+        account_id = str(auth_claims.get("chatgpt_account_id") or "").strip()
+        email_from_claims = str(claims.get("email") or "").strip()
+
+        import time as _time
+        now = int(_time.time())
+        expires_in = int(tokens.get("expires_in") or 0)
+
+        return {
+            "id_token": id_token_raw,
+            "access_token": access_token,
+            "refresh_token": str(tokens.get("refresh_token") or "").strip(),
+            "account_id": account_id,
+            "last_refresh": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(now)),
+            "email": email_from_claims,
+            "type": "codex",
+            "expired": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(now + max(expires_in, 0))),
+            "workspace_id": workspace_id,
+        }
+
     def _oauth_submit_workspace_org(self, consent_url: str) -> Optional[str]:
         session = self._decode_auth_session_cookie() or {}
         workspaces = session.get("workspaces") or []
